@@ -4,7 +4,7 @@ body {
   background: #0A1628;
   color: #F1F5F9;
   width: 400px;
-  height: 500px;
+  height: 620px;
   overflow: hidden;
   user-select: none;
 }
@@ -68,3 +68,11 @@ h2 { font-size: 18px; margin-bottom: 4px; }
 .red { background: #EF4444; }
 .spacer { flex: 1; }
 .version { color: #475569; }
+
+.unpair-btn {
+  position: absolute; top: 8px; right: 8px; background: none; border: none;
+  color: #475569; font-size: 14px; cursor: pointer; padding: 4px 6px; border-radius: 6px;
+  opacity: 0.5; transition: opacity 0.2s;
+}
+.unpair-btn:hover { opacity: 1; background: rgba(255,255,255,0.05); }
+#player-screen { position: relative; }

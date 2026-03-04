@@ -19,7 +19,7 @@ pub struct TrackInfo {
 pub struct AudioPlayer {
     volume: f32,
     is_playing: bool,
-    current_index: usize,
+    pub current_index: usize,
     playlist: Vec<TrackInfo>,
     play_started_at: Option<Instant>,
     pause_elapsed: f32,

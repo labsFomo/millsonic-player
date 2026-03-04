@@ -80,6 +80,25 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+async fn unpair_device() -> Result<(), String> {
+    log::info!("unpair_device called — clearing config and stopping playback");
+    // Stop playback
+    if let Ok(mut player) = audio::player().lock() {
+        player.stop();
+        player.set_playlist(vec![]);
+    }
+    // Clear config
+    config::AppConfig::update_and_save(|cfg| {
+        cfg.device_id = None;
+        cfg.device_token = None;
+        cfg.zone_id = None;
+        cfg.zone_name = None;
+        cfg.paired = false;
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
 fn set_volume(volume: u8) -> Result<(), String> {
     audio::set_volume(volume)?;
     config::AppConfig::update_and_save(|cfg| {
@@ -156,6 +175,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             pair_device,
+            unpair_device,
             set_volume,
             toggle_playback,
             get_now_playing,

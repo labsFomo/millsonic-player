@@ -38,6 +38,27 @@ async function pairDevice() {
   }
 }
 
+// --- Unpair ---
+async function unpairDevice() {
+  const invoke = getInvoke();
+  if (!invoke) return;
+  if (!confirm('¿Desvincular este dispositivo?')) return;
+  try {
+    await invoke('unpair_device');
+    isPaired = false;
+    isPlaying = false;
+    document.getElementById('player-screen').classList.add('hidden');
+    document.getElementById('loading-overlay').classList.add('hidden');
+    document.getElementById('pairing-screen').classList.remove('hidden');
+    document.getElementById('pairing-code').value = '';
+    document.getElementById('play-icon').textContent = '▶';
+    document.getElementById('track-title').textContent = '—';
+    document.getElementById('track-artist').textContent = '—';
+  } catch (e) {
+    console.error('Unpair error:', e);
+  }
+}
+
 // --- Playback Controls ---
 async function togglePlay() {
   const invoke = getInvoke();
@@ -152,7 +173,14 @@ async function init() {
     if (status.paired) {
       isPaired = true;
       document.getElementById('pairing-screen').classList.add('hidden');
-      document.getElementById('player-screen').classList.remove('hidden');
+      // If already playing, show player; otherwise show loading overlay
+      if (status.playing) {
+        document.getElementById('loading-overlay').classList.add('hidden');
+        document.getElementById('player-screen').classList.remove('hidden');
+      } else {
+        document.getElementById('loading-overlay').classList.remove('hidden');
+        document.getElementById('player-screen').classList.add('hidden');
+      }
 
       if (status.zoneName) {
         document.getElementById('zone-name').textContent = status.zoneName;
@@ -171,6 +199,11 @@ async function init() {
       if (status.artist) {
         document.getElementById('track-artist').textContent = status.artist;
       }
+    }
+
+    if (!status.paired) {
+      // Not paired: hide loading overlay, show pairing screen
+      document.getElementById('loading-overlay').classList.add('hidden');
     }
 
     await setupListeners();

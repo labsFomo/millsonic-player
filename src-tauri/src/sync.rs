@@ -1,9 +1,31 @@
 use crate::{api, audio, config};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use chrono_tz;
 use tokio::sync::Notify;
+
+/// Hash a string to a positive integer (same as web player's hashCode)
+fn hash_code(s: &str) -> u32 {
+    let mut hash: i32 = 0;
+    for c in s.chars() {
+        hash = ((hash << 5).wrapping_sub(hash)).wrapping_add(c as i32);
+        hash |= 0; // Convert to 32-bit integer
+    }
+    hash.unsigned_abs()
+}
+
+/// Deterministic seeded shuffle matching the web player's seededShuffle
+fn seeded_shuffle<T: Clone>(arr: &[T], seed: &str) -> Vec<T> {
+    let mut result: Vec<T> = arr.to_vec();
+    let mut s = hash_code(seed) as u64;
+    for i in (1..result.len()).rev() {
+        s = (s.wrapping_mul(1664525).wrapping_add(1013904223)) & 0x7fffffff;
+        let j = (s % (i as u64 + 1)) as usize;
+        result.swap(i, j);
+    }
+    result
+}
 
 static SYNC_TRIGGER: std::sync::OnceLock<Notify> = std::sync::OnceLock::new();
 
@@ -96,6 +118,10 @@ async fn do_sync(
 
     let mut current_tracks: Vec<serde_json::Value> = Vec::new();
     let mut playlist_id: Option<String> = None;
+    let mut slot_start_time: Option<String> = None;
+
+    // Get zone_id for seeded shuffle
+    let zone_id = config::AppConfig::load().zone_id.clone().unwrap_or_default();
 
     for slot in &slots {
         let slot_day = slot.get("dayOfWeek").and_then(|d| d.as_u64()).unwrap_or(99) as u32;
@@ -104,6 +130,7 @@ async fn do_sync(
 
         if slot_day == day_of_week && current_time.as_str() >= start && current_time.as_str() < end {
             log::info!("Matched slot: day={} {}-{}", slot_day, start, end);
+            slot_start_time = Some(start.to_string());
             if let Some(playlist) = slot.get("playlist") {
                 playlist_id = playlist.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let Some(tracks) = playlist.get("tracks").and_then(|t| t.as_array()) {
@@ -115,6 +142,15 @@ async fn do_sync(
             }
             break;
         }
+    }
+
+    // Apply seeded shuffle to match web player order
+    if !current_tracks.is_empty() {
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let start_t = slot_start_time.as_deref().unwrap_or("00:00");
+        let seed = format!("{}-{}-{}", zone_id, date_str, start_t);
+        log::info!("Shuffling {} tracks with seed: {}", current_tracks.len(), seed);
+        current_tracks = seeded_shuffle(&current_tracks, &seed);
     }
 
     if current_tracks.is_empty() {
@@ -209,60 +245,70 @@ async fn do_sync(
                 artwork_url,
             });
 
-            // Start playing from the FIRST successfully downloaded track
-            if !first_track_started && playlist.len() == 1 {
-                log::info!("First track ready, starting playback immediately");
-                let mut player = audio::player().lock().map_err(|e| e.to_string())?;
-                player.set_playlist(playlist.clone());
-                if let Err(e) = player.play_current() {
-                    log::error!("Failed to start playback: {}", e);
-                } else {
-                    first_track_started = true;
-                    *current_playlist_id().lock().unwrap() = playlist_id.clone();
-                    let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
-                    // Emit ready phase so frontend hides loading overlay
-                    let _ = handle.emit("sync-progress", serde_json::json!({
-                        "phase": "ready",
-                        "current": i + 1,
-                        "total": total_tracks,
-                        "trackName": title,
-                        "percent": percent
-                    }));
-                }
-            }
+            // We no longer start from the first track — we wait until all are downloaded
+            // to calculate the correct schedule position
         }
     }
 
-    // Update playlist with ALL downloaded tracks (background downloads complete)
+    // Update playlist with ALL downloaded tracks and calculate schedule position
     if !playlist.is_empty() {
         log::info!("All downloads complete, updating playlist with {} tracks", playlist.len());
+
+        // Calculate current position in schedule
+        let start_t = slot_start_time.as_deref().unwrap_or("00:00");
+        let parts: Vec<&str> = start_t.split(':').collect();
+        let start_h: u32 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let start_m: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let slot_start_secs = (start_h * 3600 + start_m * 60) as f64;
+        let now_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f64;
+        let elapsed_secs = if now_secs >= slot_start_secs { now_secs - slot_start_secs } else { 0.0 };
+
+        // Build timeline durations to find current track
+        let mut total_duration: f64 = 0.0;
+        for t in &playlist {
+            total_duration += t.duration as f64;
+        }
+
+        let start_index = if total_duration > 0.0 {
+            let looped_elapsed = elapsed_secs % total_duration;
+            let mut accumulated = 0.0;
+            let mut idx = 0;
+            for (i, t) in playlist.iter().enumerate() {
+                accumulated += t.duration as f64;
+                if accumulated > looped_elapsed {
+                    idx = i;
+                    break;
+                }
+            }
+            log::info!("Schedule position: elapsed={:.0}s, total_duration={:.0}s, starting at track {} of {}",
+                elapsed_secs, total_duration, idx, playlist.len());
+            idx
+        } else {
+            0
+        };
+
         let mut player = audio::player().lock().map_err(|e| e.to_string())?;
-        // Preserve current playback position - just update the playlist
-        let was_playing = player.is_playing();
         player.set_playlist(playlist);
-        if !first_track_started {
-            // Edge case: first track failed but later ones succeeded
-            if let Err(e) = player.play_current() {
-                log::error!("Failed to start playback: {}", e);
-            }
-        } else if was_playing {
-            // Re-start current track since set_playlist resets index to 0
-            if let Err(e) = player.play_current() {
-                log::error!("Failed to restart after playlist update: {}", e);
-            }
+        player.current_index = start_index;
+        if let Err(e) = player.play_current() {
+            log::error!("Failed to start playback: {}", e);
+        } else {
+            first_track_started = true;
         }
         *current_playlist_id().lock().unwrap() = playlist_id;
         let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
     }
 
-    // Emit final ready
-    let _ = handle.emit("sync-progress", serde_json::json!({
-        "phase": "ready",
-        "current": total_tracks,
-        "total": total_tracks,
-        "trackName": "",
-        "percent": 100
-    }));
+    // Emit final ready (only if we have tracks and started playing)
+    if first_track_started {
+        let _ = handle.emit("sync-progress", serde_json::json!({
+            "phase": "ready",
+            "current": total_tracks,
+            "total": total_tracks,
+            "trackName": "",
+            "percent": 100
+        }));
+    }
 
     Ok(())
 }

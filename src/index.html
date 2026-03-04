@@ -18,8 +18,8 @@
       <p class="hint">Generá el código desde tu dashboard Millsonic</p>
     </div>
 
-    <!-- Loading Overlay -->
-    <div id="loading-overlay" class="screen hidden">
+    <!-- Loading Overlay (visible by default, hidden after ready or if not paired) -->
+    <div id="loading-overlay" class="screen">
       <div class="loading-container">
         <img src="assets/logo.svg" alt="Millsonic" class="logo spinning">
         <p id="loading-text" class="loading-text">Conectando...</p>
@@ -31,6 +31,7 @@
     </div>
 
     <div id="player-screen" class="screen hidden">
+      <button id="unpair-btn" onclick="unpairDevice()" title="Desvincular dispositivo" class="unpair-btn">⚙️</button>
       <div class="now-playing">
         <img id="artwork" src="assets/default-artwork.svg" alt="" class="artwork">
         <div class="track-info">

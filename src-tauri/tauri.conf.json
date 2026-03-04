@@ -1,6 +1,6 @@
 {
   "productName": "Millsonic Player",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "identifier": "com.millsonic.player",
   "build": {
     "frontendDist": "../src",
@@ -12,7 +12,9 @@
       {
         "title": "Millsonic Player",
         "width": 400,
-        "height": 500,
+        "height": 620,
+        "minWidth": 380,
+        "minHeight": 600,
         "resizable": false,
         "center": true,
         "decorations": true
