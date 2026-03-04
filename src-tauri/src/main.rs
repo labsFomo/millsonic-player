@@ -8,6 +8,8 @@ mod api;
 
 use tauri::{Manager, Emitter};
 use std::time::Duration;
+use simplelog::{CombinedLogger, WriteLogger, LevelFilter, Config as LogConfig};
+use std::fs::OpenOptions;
 
 #[tauri::command]
 fn get_status() -> serde_json::Value {
@@ -91,8 +93,41 @@ fn get_now_playing() -> serde_json::Value {
     }
 }
 
+#[tauri::command]
+fn get_logs() -> String {
+    let log_path = config::AppConfig::data_dir().join("millsonic.log");
+    match std::fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = if lines.len() > 100 { lines.len() - 100 } else { 0 };
+            lines[start..].join("\n")
+        }
+        Err(e) => format!("Cannot read log: {}", e),
+    }
+}
+
+fn setup_logging() {
+    let log_dir = config::AppConfig::data_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("millsonic.log");
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("Cannot open log file");
+
+    CombinedLogger::init(vec![
+        WriteLogger::new(LevelFilter::Info, LogConfig::default(), file),
+    ]).expect("Cannot init logger");
+
+    log::info!("=== Millsonic Player started ===");
+    log::info!("Log file: {}", log_path.display());
+    log::info!("Version: {}", env!("CARGO_PKG_VERSION"));
+}
+
 fn main() {
-    env_logger::init();
+    setup_logging();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
@@ -105,6 +140,7 @@ fn main() {
             set_volume,
             toggle_playback,
             get_now_playing,
+            get_logs,
         ])
         .setup(|app| {
             // Load config and set initial volume

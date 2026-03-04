@@ -148,6 +148,26 @@ async function init() {
   }
 }
 
+// --- Log Viewer ---
+async function showLogs() {
+  const invoke = getInvoke();
+  if (!invoke) return;
+  try {
+    const logs = await invoke('get_logs');
+    let modal = document.getElementById('log-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'log-modal';
+      modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:1000;display:flex;flex-direction:column;padding:16px;';
+      modal.innerHTML = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><span style="color:#fff;font-weight:bold;">📋 Logs</span><button onclick="document.getElementById(\'log-modal\').remove()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button></div><pre id="log-content" style="flex:1;overflow:auto;background:#111;color:#0f0;padding:12px;border-radius:8px;font-size:11px;white-space:pre-wrap;word-break:break-all;margin:0;"></pre>';
+      document.body.appendChild(modal);
+    }
+    document.getElementById('log-content').textContent = logs;
+  } catch (e) {
+    console.error('Logs error:', e);
+  }
+}
+
 document.getElementById('pairing-code')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pairDevice();
 });

@@ -96,7 +96,13 @@ pub async fn download_track(url: &str, dest_path: &Path) -> Result<(), Box<dyn s
         std::fs::create_dir_all(parent)?;
     }
     let resp = client().get(url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {} downloading track: {}", status, &body[..body.len().min(200)]).into());
+    }
     let bytes = resp.bytes().await?;
+    log::info!("Downloaded {} bytes to {}", bytes.len(), dest_path.display());
     std::fs::write(dest_path, &bytes)?;
     Ok(())
 }

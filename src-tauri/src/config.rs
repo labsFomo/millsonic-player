@@ -72,6 +72,12 @@ impl AppConfig {
             .join("config.json")
     }
 
+    pub fn data_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Millsonic")
+    }
+
     pub fn cache_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
