@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "millsonic-player"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "chrono-tz",
