@@ -1,24 +1,51 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppConfig {
     pub device_id: Option<String>,
     pub device_token: Option<String>,
     pub zone_id: Option<String>,
+    pub zone_name: Option<String>,
     pub volume: u8,
     pub stream_quality: u16,
+    pub paired: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            device_id: None,
+            device_token: None,
+            zone_id: None,
+            zone_name: None,
+            volume: 80,
+            stream_quality: 128,
+            paired: false,
+        }
+    }
+}
+
+static CONFIG: OnceLock<Mutex<AppConfig>> = OnceLock::new();
+
+pub fn global() -> &'static Mutex<AppConfig> {
+    CONFIG.get_or_init(|| Mutex::new(AppConfig::load_from_disk()))
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
+    fn load_from_disk() -> Self {
         let path = Self::config_path();
         if path.exists() {
             let data = std::fs::read_to_string(&path).unwrap_or_default();
             serde_json::from_str(&data).unwrap_or_default()
         } else {
-            Self { volume: 80, stream_quality: 128, ..Default::default() }
+            Self::default()
         }
+    }
+
+    pub fn load() -> Self {
+        global().lock().unwrap().clone()
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -30,10 +57,29 @@ impl AppConfig {
         Ok(())
     }
 
-    fn config_path() -> PathBuf {
+    pub fn is_paired(&self) -> bool {
+        self.device_id.is_some() && self.device_token.is_some()
+    }
+
+    pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("Millsonic")
             .join("config.json")
+    }
+
+    pub fn cache_dir() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Millsonic")
+            .join("cache")
+            .join("tracks")
+    }
+
+    pub fn update_and_save<F: FnOnce(&mut AppConfig)>(f: F) -> Result<(), String> {
+        let mut cfg = global().lock().map_err(|e| e.to_string())?;
+        f(&mut cfg);
+        cfg.save().map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
