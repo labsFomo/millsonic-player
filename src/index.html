@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Millsonic Player</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <div id="pairing-screen" class="screen">
+      <img src="assets/logo.svg" alt="Millsonic" class="logo">
+      <h2>Vincular Dispositivo</h2>
+      <p class="subtitle">Ingresá el código de vinculación</p>
+      <input type="text" id="pairing-code" maxlength="6" placeholder="ABC123" autocomplete="off">
+      <button id="pair-btn" onclick="pairDevice()">Vincular</button>
+      <p id="pair-error" class="error"></p>
+      <p class="hint">Generá el código desde tu dashboard Millsonic</p>
+    </div>
+
+    <div id="player-screen" class="screen hidden">
+      <div class="now-playing">
+        <img id="artwork" src="assets/default-artwork.svg" alt="" class="artwork">
+        <div class="track-info">
+          <h2 id="track-title">—</h2>
+          <p id="track-artist">—</p>
+        </div>
+      </div>
+      
+      <div class="progress-bar">
+        <div id="progress" class="progress-fill"></div>
+      </div>
+      <div class="time-display">
+        <span id="time-current">0:00</span>
+        <span id="time-total">0:00</span>
+      </div>
+
+      <div class="controls">
+        <button id="play-pause" onclick="togglePlay()">
+          <span id="play-icon">▶</span>
+        </button>
+      </div>
+
+      <div class="volume-control">
+        <span class="volume-icon">🔊</span>
+        <input type="range" id="volume" min="0" max="100" value="80" oninput="setVolume(this.value)">
+        <span id="volume-label">80%</span>
+      </div>
+
+      <div class="status-bar">
+        <span id="status-dot" class="dot green"></span>
+        <span id="status-text">Online</span>
+        <span class="spacer"></span>
+        <span id="zone-name">—</span>
+        <span class="version">v0.1.0</span>
+      </div>
+    </div>
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>
