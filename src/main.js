@@ -25,7 +25,7 @@ async function pairDevice() {
     if (result.deviceToken) {
       isPaired = true;
       document.getElementById('pairing-screen').classList.add('hidden');
-      document.getElementById('player-screen').classList.remove('hidden');
+      document.getElementById('loading-overlay').classList.remove('hidden');
       if (result.zone && result.zone.name) {
         document.getElementById('zone-name').textContent = result.zone.name;
       }
@@ -89,15 +89,46 @@ async function setupListeners() {
       document.getElementById('progress').style.width = pct + '%';
     }
 
-    // Update artwork if available
+    // Update artwork if available, fallback to default
+    const artworkEl = document.getElementById('artwork');
     if (data.artworkUrl) {
-      document.getElementById('artwork').src = data.artworkUrl;
+      artworkEl.src = data.artworkUrl;
+      artworkEl.onerror = () => { artworkEl.src = 'assets/default-artwork.svg'; };
+    } else {
+      artworkEl.src = 'assets/default-artwork.svg';
     }
 
     // Ensure play icon shows pause when playing
     if (!isPlaying) {
       isPlaying = true;
       document.getElementById('play-icon').textContent = '⏸';
+    }
+  });
+
+  await listen('sync-progress', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    const overlay = document.getElementById('loading-overlay');
+    const loadingText = document.getElementById('loading-text');
+    const loadingBar = document.getElementById('loading-bar');
+    const loadingDetail = document.getElementById('loading-detail');
+
+    if (data.phase === 'downloading') {
+      overlay.classList.remove('hidden');
+      if (data.current === 0) {
+        loadingText.textContent = 'Sincronizando tu música...';
+      } else {
+        loadingText.textContent = `Descargando canciones (${data.current}/${data.total})...`;
+        loadingDetail.textContent = data.trackName || '';
+      }
+      loadingBar.style.width = data.percent + '%';
+    } else if (data.phase === 'ready') {
+      loadingText.textContent = '¡Listo! 🎵';
+      loadingBar.style.width = '100%';
+      setTimeout(() => {
+        overlay.classList.add('hidden');
+        document.getElementById('player-screen').classList.remove('hidden');
+      }, 600);
     }
   });
 
@@ -170,6 +201,17 @@ async function showLogs() {
 
 document.getElementById('pairing-code')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pairDevice();
+});
+
+// Auto-strip spaces and uppercase on pairing code input/paste
+document.getElementById('pairing-code')?.addEventListener('input', (e) => {
+  const el = e.target;
+  const pos = el.selectionStart;
+  const cleaned = el.value.replace(/\s/g, '').toUpperCase();
+  if (el.value !== cleaned) {
+    el.value = cleaned;
+    el.selectionStart = el.selectionEnd = Math.min(pos, cleaned.length);
+  }
 });
 
 // Wait for Tauri IPC bridge to be ready

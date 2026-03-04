@@ -29,7 +29,16 @@ h2 { font-size: 18px; margin-bottom: 4px; }
 .hint { color: #64748B; font-size: 12px; margin-top: 24px; }
 
 .now-playing { text-align: center; margin-top: 16px; }
-.artwork { width: 160px; height: 160px; border-radius: 16px; object-fit: cover; background: #111827; margin-bottom: 16px; }
+.artwork { width: 200px; height: 200px; border-radius: 16px; object-fit: cover; background: #111827; margin-bottom: 16px; transition: opacity 0.3s ease; }
+
+/* Loading Overlay */
+.loading-container { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; }
+.spinning { animation: spin 2s ease-in-out infinite; }
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+.loading-text { font-size: 16px; font-weight: 600; color: #F1F5F9; margin-top: 24px; transition: opacity 0.3s ease; }
+.loading-detail { font-size: 12px; color: #64748B; margin-top: 8px; min-height: 16px; }
+.loading-bar-container { width: 240px; height: 4px; background: #1E293B; border-radius: 2px; margin-top: 16px; overflow: hidden; }
+.loading-bar-fill { height: 100%; background: linear-gradient(90deg, #00D4AA, #00B894); border-radius: 2px; width: 0%; transition: width 0.5s ease; }
 .track-info h2 { font-size: 16px; font-weight: 600; }
 .track-info p { color: #94A3B8; font-size: 13px; margin-top: 2px; }
 

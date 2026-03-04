@@ -154,9 +154,20 @@ async fn do_sync(
     let cache_dir = config::AppConfig::cache_dir();
     std::fs::create_dir_all(&cache_dir)?;
 
+    let total_tracks = current_tracks.len();
     let mut playlist: Vec<audio::TrackInfo> = Vec::new();
+    let mut first_track_started = false;
 
-    for track_val in &current_tracks {
+    // Emit connecting phase
+    let _ = handle.emit("sync-progress", serde_json::json!({
+        "phase": "downloading",
+        "current": 0,
+        "total": total_tracks,
+        "trackName": "",
+        "percent": 0
+    }));
+
+    for (i, track_val) in current_tracks.iter().enumerate() {
         let track_id = track_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
         let title = track_val.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown");
         let artist = track_val.get("artist").and_then(|v| v.as_str()).unwrap_or("Unknown");
@@ -165,6 +176,16 @@ async fn do_sync(
         let stream_url = track_val.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("");
 
         let file_path = cache_dir.join(format!("{}.mp3", track_id));
+
+        // Emit progress
+        let percent = ((i as f64 / total_tracks as f64) * 100.0) as u32;
+        let _ = handle.emit("sync-progress", serde_json::json!({
+            "phase": "downloading",
+            "current": i + 1,
+            "total": total_tracks,
+            "trackName": title,
+            "percent": percent
+        }));
 
         // Download if not cached
         if !file_path.exists() && !stream_url.is_empty() {
@@ -187,28 +208,61 @@ async fn do_sync(
                 duration,
                 artwork_url,
             });
+
+            // Start playing from the FIRST successfully downloaded track
+            if !first_track_started && playlist.len() == 1 {
+                log::info!("First track ready, starting playback immediately");
+                let mut player = audio::player().lock().map_err(|e| e.to_string())?;
+                player.set_playlist(playlist.clone());
+                if let Err(e) = player.play_current() {
+                    log::error!("Failed to start playback: {}", e);
+                } else {
+                    first_track_started = true;
+                    *current_playlist_id().lock().unwrap() = playlist_id.clone();
+                    let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
+                    // Emit ready phase so frontend hides loading overlay
+                    let _ = handle.emit("sync-progress", serde_json::json!({
+                        "phase": "ready",
+                        "current": i + 1,
+                        "total": total_tracks,
+                        "trackName": title,
+                        "percent": percent
+                    }));
+                }
+            }
         }
     }
 
-    // Log playlist file status
-    for t in &playlist {
-        let exists = std::path::Path::new(&t.file_path).exists();
-        let size = std::fs::metadata(&t.file_path).map(|m| m.len()).unwrap_or(0);
-        log::info!("Playlist track: '{}' | file={} | exists={} | size={} bytes", t.title, t.file_path, exists, size);
-    }
-
+    // Update playlist with ALL downloaded tracks (background downloads complete)
     if !playlist.is_empty() {
-        log::info!("Starting playback with {} tracks", playlist.len());
+        log::info!("All downloads complete, updating playlist with {} tracks", playlist.len());
         let mut player = audio::player().lock().map_err(|e| e.to_string())?;
+        // Preserve current playback position - just update the playlist
+        let was_playing = player.is_playing();
         player.set_playlist(playlist);
-        if let Err(e) = player.play_current() {
-            log::error!("Failed to start playback: {}", e);
+        if !first_track_started {
+            // Edge case: first track failed but later ones succeeded
+            if let Err(e) = player.play_current() {
+                log::error!("Failed to start playback: {}", e);
+            }
+        } else if was_playing {
+            // Re-start current track since set_playlist resets index to 0
+            if let Err(e) = player.play_current() {
+                log::error!("Failed to restart after playlist update: {}", e);
+            }
         }
-        // Update current playlist ID
         *current_playlist_id().lock().unwrap() = playlist_id;
-        // Notify frontend
         let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
     }
+
+    // Emit final ready
+    let _ = handle.emit("sync-progress", serde_json::json!({
+        "phase": "ready",
+        "current": total_tracks,
+        "total": total_tracks,
+        "trackName": "",
+        "percent": 100
+    }));
 
     Ok(())
 }

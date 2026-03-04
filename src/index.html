@@ -18,6 +18,18 @@
       <p class="hint">Generá el código desde tu dashboard Millsonic</p>
     </div>
 
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="screen hidden">
+      <div class="loading-container">
+        <img src="assets/logo.svg" alt="Millsonic" class="logo spinning">
+        <p id="loading-text" class="loading-text">Conectando...</p>
+        <div class="loading-bar-container">
+          <div id="loading-bar" class="loading-bar-fill"></div>
+        </div>
+        <p id="loading-detail" class="loading-detail"></p>
+      </div>
+    </div>
+
     <div id="player-screen" class="screen hidden">
       <div class="now-playing">
         <img id="artwork" src="assets/default-artwork.svg" alt="" class="artwork">
