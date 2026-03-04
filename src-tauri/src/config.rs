@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub volume: u8,
     pub stream_quality: u16,
     pub paired: bool,
+    pub hardware_id: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -23,6 +24,7 @@ impl Default for AppConfig {
             volume: 80,
             stream_quality: 128,
             paired: false,
+            hardware_id: None,
         }
     }
 }
@@ -82,4 +84,12 @@ impl AppConfig {
         cfg.save().map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+pub fn get_config() -> AppConfig {
+    AppConfig::load()
+}
+
+pub fn update_and_save_global<F: FnOnce(&mut AppConfig)>(f: F) {
+    let _ = AppConfig::update_and_save(f);
 }

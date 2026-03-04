@@ -1,11 +1,17 @@
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
-
 let isPaired = false;
 let isPlaying = false;
 
+function getInvoke() {
+  return window.__TAURI__?.core?.invoke || window.__TAURI__?.tauri?.invoke;
+}
+function getListen() {
+  return window.__TAURI__?.event?.listen;
+}
+
 // --- Pairing ---
 async function pairDevice() {
+  const invoke = getInvoke();
+  if (!invoke) { document.getElementById('pair-error').textContent = 'Tauri API no disponible'; return; }
   const code = document.getElementById('pairing-code').value.trim().toUpperCase();
   const errorEl = document.getElementById('pair-error');
 
@@ -34,6 +40,8 @@ async function pairDevice() {
 
 // --- Playback Controls ---
 async function togglePlay() {
+  const invoke = getInvoke();
+  if (!invoke) return;
   try {
     const state = await invoke('toggle_playback');
     isPlaying = state === 'playing';
@@ -44,7 +52,9 @@ async function togglePlay() {
 }
 
 async function setVolume(val) {
+  const invoke = getInvoke();
   document.getElementById('volume-label').textContent = val + '%';
+  if (!invoke) return;
   try {
     await invoke('set_volume', { volume: parseInt(val) });
   } catch (e) {
@@ -62,6 +72,8 @@ function formatTime(seconds) {
 
 // --- Event Listeners ---
 async function setupListeners() {
+  const listen = getListen();
+  if (!listen) { console.warn('Tauri event API not available'); return; }
   await listen('now-playing', (event) => {
     const data = event.payload;
     if (!data) return;
@@ -100,6 +112,8 @@ async function setupListeners() {
 
 // --- Init ---
 async function init() {
+  const invoke = getInvoke();
+  if (!invoke) { console.error('Tauri API not loaded yet'); return; }
   try {
     const status = await invoke('get_status');
     console.log('Player status:', status);

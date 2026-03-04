@@ -11,12 +11,30 @@ fn client() -> reqwest::Client {
 struct PairRequest {
     #[serde(rename = "pairingCode")]
     pairing_code: String,
+    #[serde(rename = "hardwareId")]
+    hardware_id: String,
+}
+
+fn get_hardware_id() -> String {
+    // Try to load persisted hardware ID, or generate one
+    let config = crate::config::get_config();
+    if let Some(ref hw_id) = config.hardware_id {
+        return hw_id.clone();
+    }
+    let hw_id = format!("tauri-{}", uuid::Uuid::new_v4());
+    drop(config);
+    // Save it
+    crate::config::update_and_save_global(|c| { c.hardware_id = Some(hw_id.clone()); });
+    hw_id
 }
 
 pub async fn pair_with_code(code: &str) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let resp = client()
         .post(format!("{}/devices/pair", API_BASE))
-        .json(&PairRequest { pairing_code: code.to_string() })
+        .json(&PairRequest {
+            pairing_code: code.to_string(),
+            hardware_id: get_hardware_id(),
+        })
         .send()
         .await?
         .json::<serde_json::Value>()
