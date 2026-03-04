@@ -2,6 +2,8 @@
 name = "millsonic-player"
 version = "0.1.6"
 edition = "2021"
+default-run = "millsonic-player"
+default-run = "millsonic-player"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "devtools"] }
@@ -21,10 +23,6 @@ chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
 log = "0.4"
 simplelog = "0.12"
-
-[[bin]]
-name = "headless_test"
-path = "src/bin/headless_test.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
