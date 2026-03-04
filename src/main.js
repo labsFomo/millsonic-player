@@ -12,7 +12,7 @@ function getListen() {
 async function pairDevice() {
   const invoke = getInvoke();
   if (!invoke) { document.getElementById('pair-error').textContent = 'Tauri API no disponible'; return; }
-  const code = document.getElementById('pairing-code').value.trim().toUpperCase();
+  const code = document.getElementById('pairing-code').value.trim().toUpperCase().replace(/\s/g, '');
   const errorEl = document.getElementById('pair-error');
 
   if (code.length !== 6) {

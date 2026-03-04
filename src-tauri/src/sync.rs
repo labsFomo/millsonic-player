@@ -2,6 +2,7 @@ use crate::{api, audio, config};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use chrono::Datelike;
+use chrono_tz;
 
 /// Track the current playlist ID to avoid restarting playback on re-sync
 static CURRENT_PLAYLIST_ID: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
@@ -49,11 +50,21 @@ async fn do_sync(
         }
     }
 
+    // Get timezone from sync response
+    let tz_str = sync_data.get("timezone").and_then(|v| v.as_str()).unwrap_or("America/Montevideo");
+    let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
+    let now = chrono::Utc::now().with_timezone(&tz);
+
+    // Save timezone in config for offline use
+    let tz_owned = tz_str.to_string();
+    config::update_and_save_global(|c| {
+        c.timezone = Some(tz_owned.clone());
+    });
+
     // Parse schedule and find current slot
     let schedule = sync_data.get("schedule").cloned().unwrap_or(serde_json::json!([]));
     let slots = schedule.as_array().cloned().unwrap_or_default();
 
-    let now = chrono::Local::now();
     // API uses 0=Sunday, 1=Monday...6=Saturday
     let day_of_week = now.weekday().num_days_from_sunday(); // 0=Sun, 1=Mon...6=Sat
     let current_time = now.format("%H:%M").to_string();

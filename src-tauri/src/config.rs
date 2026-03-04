@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub stream_quality: u16,
     pub paired: bool,
     pub hardware_id: Option<String>,
+    pub timezone: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -25,6 +26,7 @@ impl Default for AppConfig {
             stream_quality: 128,
             paired: false,
             hardware_id: None,
+            timezone: None,
         }
     }
 }
