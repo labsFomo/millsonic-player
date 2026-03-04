@@ -1,7 +1,14 @@
 use crate::{api, audio, config};
-use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+use chrono::Datelike;
+
+/// Track the current playlist ID to avoid restarting playback on re-sync
+static CURRENT_PLAYLIST_ID: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+fn current_playlist_id() -> &'static std::sync::Mutex<Option<String>> {
+    CURRENT_PLAYLIST_ID.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 pub async fn start_sync_loop(handle: AppHandle) {
     loop {
@@ -29,26 +36,47 @@ async fn do_sync(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sync_data = api::sync_device(device_id, device_token).await?;
 
+    // Check for API error
+    if sync_data.get("statusCode").is_some() {
+        let msg = sync_data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+        return Err(format!("Sync API error: {}", msg).into());
+    }
+
+    // Apply volume from server if present
+    if let Some(device) = sync_data.get("device") {
+        if let Some(vol) = device.get("volume").and_then(|v| v.as_u64()) {
+            let _ = audio::set_volume(vol as u8);
+        }
+    }
+
     // Parse schedule and find current slot
     let schedule = sync_data.get("schedule").cloned().unwrap_or(serde_json::json!([]));
     let slots = schedule.as_array().cloned().unwrap_or_default();
 
     let now = chrono::Local::now();
-    let day_of_week = now.format("%u").to_string().parse::<u32>().unwrap_or(1); // 1=Mon
-    let current_time = now.format("%H:%M:%S").to_string();
+    // API uses 0=Sunday, 1=Monday...6=Saturday
+    let day_of_week = now.weekday().num_days_from_sunday(); // 0=Sun, 1=Mon...6=Sat
+    let current_time = now.format("%H:%M").to_string();
+
+    log::info!("Looking for schedule: dayOfWeek={}, time={}", day_of_week, current_time);
 
     let mut current_tracks: Vec<serde_json::Value> = Vec::new();
+    let mut playlist_id: Option<String> = None;
 
     for slot in &slots {
-        let slot_day = slot.get("dayOfWeek").and_then(|d| d.as_u64()).unwrap_or(0) as u32;
-        let start = slot.get("startTime").and_then(|s| s.as_str()).unwrap_or("00:00:00");
-        let end = slot.get("endTime").and_then(|s| s.as_str()).unwrap_or("23:59:59");
+        let slot_day = slot.get("dayOfWeek").and_then(|d| d.as_u64()).unwrap_or(99) as u32;
+        let start = slot.get("startTime").and_then(|s| s.as_str()).unwrap_or("00:00");
+        let end = slot.get("endTime").and_then(|s| s.as_str()).unwrap_or("23:59");
 
         if slot_day == day_of_week && current_time.as_str() >= start && current_time.as_str() < end {
-            // Found matching slot - get playlist tracks
+            log::info!("Matched slot: day={} {}-{}", slot_day, start, end);
             if let Some(playlist) = slot.get("playlist") {
+                playlist_id = playlist.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let Some(tracks) = playlist.get("tracks").and_then(|t| t.as_array()) {
                     current_tracks = tracks.clone();
+                    log::info!("Found {} tracks in playlist '{}'",
+                        tracks.len(),
+                        playlist.get("name").and_then(|n| n.as_str()).unwrap_or("?"));
                 }
             }
             break;
@@ -57,10 +85,38 @@ async fn do_sync(
 
     if current_tracks.is_empty() {
         log::info!("No tracks scheduled for current time slot");
+        // Emit "no schedule" to frontend
+        let _ = handle.emit("now-playing", serde_json::json!({
+            "title": "Sin programación",
+            "artist": "No hay música programada en este horario",
+            "duration": 0,
+            "position": 0,
+            "artworkUrl": null,
+        }));
+        // Stop playback if playing
+        if let Ok(mut player) = audio::player().lock() {
+            if player.is_playing() {
+                player.stop();
+            }
+        }
+        *current_playlist_id().lock().unwrap() = None;
         return Ok(());
     }
 
-    // Download tracks and build playlist
+    // Check if playlist changed — if same playlist is already playing, just refresh cache (URLs)
+    let same_playlist = {
+        let cur = current_playlist_id().lock().unwrap();
+        cur.as_deref() == playlist_id.as_deref()
+    };
+
+    if same_playlist {
+        // Same playlist — just re-download any missing tracks (URLs refreshed)
+        log::info!("Same playlist still active, refreshing track cache only");
+        refresh_track_cache(&current_tracks).await;
+        return Ok(());
+    }
+
+    // Different playlist or first sync — download and start playing
     let cache_dir = config::AppConfig::cache_dir();
     std::fs::create_dir_all(&cache_dir)?;
 
@@ -101,16 +157,38 @@ async fn do_sync(
     }
 
     if !playlist.is_empty() {
+        log::info!("Starting playback with {} tracks", playlist.len());
         let mut player = audio::player().lock().map_err(|e| e.to_string())?;
         player.set_playlist(playlist);
         if let Err(e) = player.play_current() {
             log::error!("Failed to start playback: {}", e);
         }
+        // Update current playlist ID
+        *current_playlist_id().lock().unwrap() = playlist_id;
         // Notify frontend
         let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
     }
 
     Ok(())
+}
+
+async fn refresh_track_cache(tracks: &[serde_json::Value]) {
+    let cache_dir = config::AppConfig::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    for track_val in tracks {
+        let track_id = track_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let stream_url = track_val.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let file_path = cache_dir.join(format!("{}.mp3", track_id));
+
+        if !file_path.exists() && !stream_url.is_empty() {
+            let title = track_val.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+            log::info!("Downloading missing track: {}", title);
+            if let Err(e) = api::download_track(stream_url, &file_path).await {
+                log::error!("Failed to download {}: {}", title, e);
+            }
+        }
+    }
 }
 
 /// Called from main.rs every second to check if track ended and advance
