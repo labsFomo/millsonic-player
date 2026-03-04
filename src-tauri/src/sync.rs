@@ -211,11 +211,20 @@ pub fn check_track_advancement(handle: &AppHandle) {
     };
 
     if player.is_playing() && player.is_finished() {
-        log::info!("Track finished, advancing...");
+        if let Some(track) = player.current_track() {
+            log::info!("Track finished: '{}' by '{}'", track.title, track.artist);
+        }
         if player.advance() {
-            if let Err(e) = player.play_current() {
-                log::error!("Error playing next track: {}", e);
+            if let Some(track) = player.current_track() {
+                log::info!("Playing next: '{}' ({})", track.title, track.file_path);
             }
+            if let Err(e) = player.play_current() {
+                log::error!("Error playing next track: {} — stopping playback", e);
+                player.stop();
+            }
+        } else {
+            log::warn!("No more tracks to advance to — stopping");
+            player.stop();
         }
         // Emit now-playing update
         if let Some(track) = player.current_track() {

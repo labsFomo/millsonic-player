@@ -28,6 +28,7 @@ pub struct AudioPlayer {
     _stream: Option<rodio::OutputStream>,
     _stream_handle: Option<rodio::OutputStreamHandle>,
     audio_available: bool,
+    pub consecutive_skips: usize,
 }
 
 // Safety: OutputStream is !Send but we only access from one thread via Mutex
@@ -66,27 +67,38 @@ impl AudioPlayer {
             _stream: stream,
             _stream_handle: handle,
             audio_available: available,
+            consecutive_skips: 0,
         }
     }
 
     pub fn play_file(&mut self, track: &TrackInfo) -> Result<(), String> {
+        log::info!("play_file: '{}' at {}", track.title, track.file_path);
+
         if !self.audio_available {
-            log::info!("Audio not available, simulating playback of: {}", track.title);
+            log::warn!("Audio not available, simulating playback of: {}", track.title);
             self.is_playing = true;
             self.play_started_at = Some(Instant::now());
             self.pause_elapsed = 0.0;
             return Ok(());
         }
 
+        // Verify file exists and has content
+        let metadata = std::fs::metadata(&track.file_path)
+            .map_err(|e| format!("Cannot stat file {}: {}", track.file_path, e))?;
+        log::info!("File size: {} bytes", metadata.len());
+        if metadata.len() < 1000 {
+            return Err(format!("File too small ({} bytes), likely corrupt: {}", metadata.len(), track.file_path));
+        }
+
         let file = std::fs::File::open(&track.file_path)
             .map_err(|e| format!("Cannot open file {}: {}", track.file_path, e))?;
         let reader = std::io::BufReader::new(file);
         let source = rodio::Decoder::new(reader)
-            .map_err(|e| format!("Cannot decode audio: {}", e))?;
+            .map_err(|e| format!("Cannot decode audio {}: {}", track.file_path, e))?;
+        log::info!("Audio decoded OK");
 
         if let Some(ref sink) = self.sink {
             sink.stop();
-            // Need to recreate sink after stop
         }
         // Recreate sink
         if let Some(ref handle) = self._stream_handle {
@@ -94,10 +106,13 @@ impl AudioPlayer {
                 Ok(new_sink) => {
                     new_sink.set_volume(self.volume);
                     new_sink.append(source);
+                    log::info!("Sink created and source appended, playing");
                     self.sink = Some(new_sink);
                 }
                 Err(e) => return Err(format!("Cannot create sink: {}", e)),
             }
+        } else {
+            return Err("No audio stream handle available".to_string());
         }
 
         self.is_playing = true;
@@ -199,6 +214,10 @@ impl AudioPlayer {
             self.current_index = 0;
             !self.playlist.is_empty()
         }
+    }
+
+    pub fn playlist_len(&self) -> usize {
+        self.playlist.len()
     }
 
     pub fn skip_track(&mut self) -> Result<(), String> {
