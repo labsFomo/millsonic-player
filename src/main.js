@@ -152,4 +152,14 @@ document.getElementById('pairing-code')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pairDevice();
 });
 
-init();
+// Wait for Tauri IPC bridge to be ready
+function waitForTauri(retries = 50) {
+  if (window.__TAURI__) {
+    init();
+  } else if (retries > 0) {
+    setTimeout(() => waitForTauri(retries - 1), 100);
+  } else {
+    document.getElementById('pair-error').textContent = 'Tauri API no disponible (timeout)';
+  }
+}
+waitForTauri();
