@@ -38,6 +38,9 @@ pub async fn start_sync_loop(handle: AppHandle) {
             }
         } else {
             log::info!("Not paired, waiting...");
+            // When not paired, check every 5s so we pick up pairing quickly
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
         }
 
         // Wait for either 300s or a manual trigger (e.g. after pairing)

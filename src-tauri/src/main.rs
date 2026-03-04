@@ -34,7 +34,11 @@ fn get_status() -> serde_json::Value {
 
 #[tauri::command]
 async fn pair_device(code: String) -> Result<serde_json::Value, String> {
-    let resp = api::pair_with_code(&code).await.map_err(|e| e.to_string())?;
+    log::info!("pair_device called with code: {}", code);
+    let resp = api::pair_with_code(&code).await.map_err(|e| {
+        log::error!("pair_device API error: {}", e);
+        e.to_string()
+    })?;
 
     // Check for error in response
     if resp.get("statusCode").is_some() {
@@ -48,6 +52,8 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
     let zone_name = resp.get("zone").and_then(|z| z.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string());
 
     if device_id.is_some() && device_token.is_some() {
+        log::info!("Pairing successful! device={} zone={}", 
+            device_id.as_deref().unwrap_or("?"), zone_name.as_deref().unwrap_or("?"));
         config::AppConfig::update_and_save(|cfg| {
             cfg.device_id = device_id;
             cfg.device_token = device_token;
@@ -56,7 +62,10 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
             cfg.paired = true;
         })?;
         // Trigger immediate sync after successful pairing
+        log::info!("Triggering immediate sync...");
         sync::trigger_sync();
+    } else {
+        log::warn!("Pairing response missing device_id or token: {:?}", resp);
     }
 
     Ok(resp)
