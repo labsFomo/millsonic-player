@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod db;
 mod sync;
 mod config;
 mod telemetry;
@@ -19,6 +20,11 @@ fn get_status() -> serde_json::Value {
     let volume = player.as_ref().map(|p| p.get_volume()).unwrap_or(80);
     let track = player.as_ref().and_then(|p| p.current_track().map(|t| t.title.clone()));
     let artist = player.as_ref().and_then(|p| p.current_track().map(|t| t.artist.clone()));
+    let conn_status = match sync::get_connection_status() {
+        sync::ConnectionStatus::Online => "online",
+        sync::ConnectionStatus::Offline => "offline",
+        sync::ConnectionStatus::Emergency => "emergency",
+    };
 
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -28,7 +34,7 @@ fn get_status() -> serde_json::Value {
         "track": track,
         "artist": artist,
         "zoneName": cfg.zone_name,
-        "online": true,
+        "connectionStatus": conn_status,
     })
 }
 
@@ -201,6 +207,11 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 sync::start_sync_loop(handle).await;
+            });
+
+            // Start batch report flusher
+            tauri::async_runtime::spawn(async move {
+                sync::start_report_flusher().await;
             });
 
             // Start telemetry loop

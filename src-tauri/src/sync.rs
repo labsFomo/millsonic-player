@@ -1,16 +1,49 @@
-use crate::{api, audio, config};
+use crate::{api, audio, config, db};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, Timelike, Utc};
 use chrono_tz;
 use tokio::sync::Notify;
+use std::sync::{Mutex, OnceLock};
+
+/// Connection status: Online, Offline (cached), Emergency
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConnectionStatus {
+    Online,
+    Offline,
+    Emergency,
+}
+
+static CONNECTION_STATUS: OnceLock<Mutex<ConnectionStatus>> = OnceLock::new();
+
+fn conn_status() -> &'static Mutex<ConnectionStatus> {
+    CONNECTION_STATUS.get_or_init(|| Mutex::new(ConnectionStatus::Online))
+}
+
+pub fn get_connection_status() -> ConnectionStatus {
+    *conn_status().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_connection_status(status: ConnectionStatus, handle: &AppHandle) {
+    let mut s = conn_status().lock().unwrap_or_else(|e| e.into_inner());
+    if *s != status {
+        log::info!("Connection status: {:?} → {:?}", *s, status);
+        *s = status;
+    }
+    let status_str = match status {
+        ConnectionStatus::Online => "online",
+        ConnectionStatus::Offline => "offline",
+        ConnectionStatus::Emergency => "emergency",
+    };
+    let _ = handle.emit("connection-status", serde_json::json!({ "status": status_str }));
+}
 
 /// Hash a string to a positive integer (same as web player's hashCode)
 fn hash_code(s: &str) -> u32 {
     let mut hash: i32 = 0;
     for c in s.chars() {
         hash = ((hash << 5).wrapping_sub(hash)).wrapping_add(c as i32);
-        hash |= 0; // Convert to 32-bit integer
+        hash |= 0;
     }
     hash.unsigned_abs()
 }
@@ -27,7 +60,7 @@ fn seeded_shuffle<T: Clone>(arr: &[T], seed: &str) -> Vec<T> {
     result
 }
 
-static SYNC_TRIGGER: std::sync::OnceLock<Notify> = std::sync::OnceLock::new();
+static SYNC_TRIGGER: OnceLock<Notify> = OnceLock::new();
 
 fn sync_trigger() -> &'static Notify {
     SYNC_TRIGGER.get_or_init(|| Notify::new())
@@ -40,14 +73,18 @@ pub fn trigger_sync() {
 }
 
 /// Track the current playlist ID to avoid restarting playback on re-sync
-static CURRENT_PLAYLIST_ID: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+static CURRENT_PLAYLIST_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-fn current_playlist_id() -> &'static std::sync::Mutex<Option<String>> {
-    CURRENT_PLAYLIST_ID.get_or_init(|| std::sync::Mutex::new(None))
+fn current_playlist_id() -> &'static Mutex<Option<String>> {
+    CURRENT_PLAYLIST_ID.get_or_init(|| Mutex::new(None))
 }
 
 pub async fn start_sync_loop(handle: AppHandle) {
     log::info!("Sync loop started");
+
+    // Init DB on first run
+    let _ = db::db();
+
     loop {
         let cfg = config::AppConfig::load();
         if cfg.is_paired() {
@@ -56,22 +93,186 @@ pub async fn start_sync_loop(handle: AppHandle) {
 
             match do_sync(&handle, &device_id, &device_token).await {
                 Ok(_) => log::info!("Sync completed successfully"),
-                Err(e) => log::error!("Sync error: {}", e),
+                Err(e) => {
+                    log::error!("Sync error: {}", e);
+                    // Try offline fallback
+                    handle_offline_fallback(&handle, &cfg);
+                }
             }
+
+            // After sync, try to flush pending play reports
+            flush_pending_reports(&device_id, &device_token).await;
+
+            // Run LRU cache cleanup
+            db::cleanup_cache();
+            db::cleanup_sent_reports();
         } else {
             log::info!("Not paired, waiting...");
-            // When not paired, check every 5s so we pick up pairing quickly
             tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
-        // Wait for either 300s or a manual trigger (e.g. after pairing)
+        // Wait for either 300s or a manual trigger
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(300)) => {},
             _ = sync_trigger().notified() => {
                 log::info!("Sync woken by trigger");
             },
         }
+    }
+}
+
+/// Start batch report flusher (every 5 minutes)
+pub async fn start_report_flusher() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        let cfg = config::AppConfig::load();
+        if cfg.is_paired() {
+            let device_id = cfg.device_id.clone().unwrap();
+            let device_token = cfg.device_token.clone().unwrap();
+            flush_pending_reports(&device_id, &device_token).await;
+        }
+    }
+}
+
+async fn flush_pending_reports(device_id: &str, device_token: &str) {
+    let reports = db::get_pending_reports();
+    if reports.is_empty() { return; }
+
+    log::info!("Flushing {} pending play reports", reports.len());
+    let ids: Vec<i64> = reports.iter().map(|r| r.0).collect();
+    let report_data: Vec<serde_json::Value> = reports.iter().map(|r| {
+        serde_json::json!({
+            "trackId": r.1,
+            "zoneId": r.2,
+            "startedAt": r.3,
+            "durationSecs": r.4,
+        })
+    }).collect();
+
+    match api::report_plays_batch(device_id, device_token, report_data).await {
+        Ok(_) => {
+            db::mark_reports_sent(&ids);
+            log::info!("Flushed {} play reports successfully", ids.len());
+        }
+        Err(e) => {
+            log::warn!("Failed to flush play reports (will retry): {}", e);
+        }
+    }
+}
+
+fn handle_offline_fallback(handle: &AppHandle, cfg: &config::AppConfig) {
+    let zone_id = cfg.zone_id.as_deref().unwrap_or("");
+
+    // Check if we already have a playlist playing
+    if let Ok(player) = audio::player().lock() {
+        if player.is_playing() && player.playlist_len() > 0 {
+            // Already playing, just mark offline
+            set_connection_status(ConnectionStatus::Offline, handle);
+            return;
+        }
+    }
+
+    // Try to load cached schedule
+    let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
+    let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
+    let now = Utc::now().with_timezone(&tz);
+    let day_of_week = now.weekday().num_days_from_sunday();
+
+    let cached_slots = db::load_schedule(zone_id, day_of_week);
+    let current_time = now.format("%H:%M").to_string();
+
+    // Find matching slot
+    let mut found_tracks = false;
+    for slot in &cached_slots {
+        let start = slot.get("startTime").and_then(|s| s.as_str()).unwrap_or("00:00");
+        let end = slot.get("endTime").and_then(|s| s.as_str()).unwrap_or("23:59");
+        if current_time.as_str() >= start && current_time.as_str() < end {
+            if let Some(tracks) = slot.get("playlist").and_then(|p| p.get("tracks")).and_then(|t| t.as_array()) {
+                if !tracks.is_empty() {
+                    log::info!("Offline: using cached schedule with {} tracks", tracks.len());
+                    set_connection_status(ConnectionStatus::Offline, handle);
+                    // Load cached tracks into player
+                    load_cached_tracks_into_player(tracks, zone_id, &now);
+                    found_tracks = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if !found_tracks {
+        // Emergency mode: shuffle all cached tracks
+        enter_emergency_mode(handle);
+    }
+}
+
+fn load_cached_tracks_into_player(tracks: &[serde_json::Value], zone_id: &str, now: &chrono::DateTime<chrono_tz::Tz>) {
+    let cache_dir = config::AppConfig::cache_dir();
+    let mut playlist: Vec<audio::TrackInfo> = Vec::new();
+
+    for track_val in tracks {
+        let track_id = track_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let file_path = cache_dir.join(format!("{}.mp3", track_id));
+        if file_path.exists() {
+            playlist.push(audio::TrackInfo {
+                track_id: track_id.to_string(),
+                title: track_val.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                artist: track_val.get("artist").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                file_path: file_path.to_string_lossy().to_string(),
+                duration: track_val.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                artwork_url: track_val.get("artworkUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            });
+        }
+    }
+
+    if !playlist.is_empty() {
+        // Apply seeded shuffle
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let seed = format!("{}-{}-00:00", zone_id, date_str);
+        playlist = seeded_shuffle(&playlist, &seed);
+
+        if let Ok(mut player) = audio::player().lock() {
+            player.set_playlist(playlist);
+            let _ = player.play_current();
+        }
+    }
+}
+
+fn enter_emergency_mode(handle: &AppHandle) {
+    log::warn!("Entering EMERGENCY mode — shuffling all cached tracks");
+    set_connection_status(ConnectionStatus::Emergency, handle);
+
+    let cached = db::get_all_cached_tracks();
+    let mut playlist: Vec<audio::TrackInfo> = Vec::new();
+
+    for (id, title, artist, artwork_url, duration, file_path) in &cached {
+        if std::path::Path::new(file_path).exists() {
+            playlist.push(audio::TrackInfo {
+                track_id: id.clone(),
+                title: title.clone(),
+                artist: artist.clone(),
+                file_path: file_path.clone(),
+                duration: *duration,
+                artwork_url: artwork_url.clone(),
+            });
+        }
+    }
+
+    if playlist.is_empty() {
+        log::error!("Emergency mode: NO cached tracks available!");
+        return;
+    }
+
+    // Random shuffle for emergency
+    use rand::seq::SliceRandom;
+    let mut rng = rand::thread_rng();
+    playlist.shuffle(&mut rng);
+
+    log::info!("Emergency mode: playing {} cached tracks on shuffle", playlist.len());
+    if let Ok(mut player) = audio::player().lock() {
+        player.set_playlist(playlist);
+        let _ = player.play_current();
     }
 }
 
@@ -87,6 +288,9 @@ async fn do_sync(
         let msg = sync_data.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
         return Err(format!("Sync API error: {}", msg).into());
     }
+
+    // We're online!
+    set_connection_status(ConnectionStatus::Online, handle);
 
     // Apply volume from server if present
     if let Some(device) = sync_data.get("device") {
@@ -106,12 +310,15 @@ async fn do_sync(
         c.timezone = Some(tz_owned.clone());
     });
 
-    // Parse schedule and find current slot
+    // Parse schedule and save to SQLite
     let schedule = sync_data.get("schedule").cloned().unwrap_or(serde_json::json!([]));
     let slots = schedule.as_array().cloned().unwrap_or_default();
 
+    let zone_id = config::AppConfig::load().zone_id.clone().unwrap_or_default();
+    db::save_schedule(&zone_id, &slots);
+
     // API uses 0=Sunday, 1=Monday...6=Saturday
-    let day_of_week = now.weekday().num_days_from_sunday(); // 0=Sun, 1=Mon...6=Sat
+    let day_of_week = now.weekday().num_days_from_sunday();
     let current_time = now.format("%H:%M").to_string();
 
     log::info!("Looking for schedule: dayOfWeek={}, time={}", day_of_week, current_time);
@@ -119,9 +326,6 @@ async fn do_sync(
     let mut current_tracks: Vec<serde_json::Value> = Vec::new();
     let mut playlist_id: Option<String> = None;
     let mut slot_start_time: Option<String> = None;
-
-    // Get zone_id for seeded shuffle
-    let zone_id = config::AppConfig::load().zone_id.clone().unwrap_or_default();
 
     for slot in &slots {
         let slot_day = slot.get("dayOfWeek").and_then(|d| d.as_u64()).unwrap_or(99) as u32;
@@ -155,7 +359,6 @@ async fn do_sync(
 
     if current_tracks.is_empty() {
         log::info!("No tracks scheduled for current time slot");
-        // Emit "no schedule" to frontend
         let _ = handle.emit("now-playing", serde_json::json!({
             "title": "Sin programación",
             "artist": "No hay música programada en este horario",
@@ -163,7 +366,6 @@ async fn do_sync(
             "position": 0,
             "artworkUrl": null,
         }));
-        // Stop playback if playing
         if let Ok(mut player) = audio::player().lock() {
             if player.is_playing() {
                 player.stop();
@@ -173,14 +375,13 @@ async fn do_sync(
         return Ok(());
     }
 
-    // Check if playlist changed — if same playlist is already playing, just refresh cache (URLs)
+    // Check if playlist changed
     let same_playlist = {
         let cur = current_playlist_id().lock().unwrap();
         cur.as_deref() == playlist_id.as_deref()
     };
 
     if same_playlist {
-        // Same playlist — just re-download any missing tracks (URLs refreshed)
         log::info!("Same playlist still active, refreshing track cache only");
         refresh_track_cache(&current_tracks).await;
         return Ok(());
@@ -194,7 +395,6 @@ async fn do_sync(
     let mut playlist: Vec<audio::TrackInfo> = Vec::new();
     let mut first_track_started = false;
 
-    // Emit connecting phase
     let _ = handle.emit("sync-progress", serde_json::json!({
         "phase": "downloading",
         "current": 0,
@@ -213,7 +413,6 @@ async fn do_sync(
 
         let file_path = cache_dir.join(format!("{}.mp3", track_id));
 
-        // Emit progress
         let percent = ((i as f64 / total_tracks as f64) * 100.0) as u32;
         let _ = handle.emit("sync-progress", serde_json::json!({
             "phase": "downloading",
@@ -223,7 +422,6 @@ async fn do_sync(
             "percent": percent
         }));
 
-        // Download if not cached
         if !file_path.exists() && !stream_url.is_empty() {
             log::info!("Downloading track: {} - {}", track_id, title);
             match api::download_track(stream_url, &file_path).await {
@@ -236,25 +434,24 @@ async fn do_sync(
         }
 
         if file_path.exists() {
+            let fp_str = file_path.to_string_lossy().to_string();
+            // Save track to SQLite
+            db::upsert_track(track_id, title, artist, artwork_url.as_deref(), duration, &fp_str);
+
             playlist.push(audio::TrackInfo {
                 track_id: track_id.to_string(),
                 title: title.to_string(),
                 artist: artist.to_string(),
-                file_path: file_path.to_string_lossy().to_string(),
+                file_path: fp_str,
                 duration,
                 artwork_url,
             });
-
-            // We no longer start from the first track — we wait until all are downloaded
-            // to calculate the correct schedule position
         }
     }
 
-    // Update playlist with ALL downloaded tracks and calculate schedule position
     if !playlist.is_empty() {
         log::info!("All downloads complete, updating playlist with {} tracks", playlist.len());
 
-        // Calculate current position in schedule
         let start_t = slot_start_time.as_deref().unwrap_or("00:00");
         let parts: Vec<&str> = start_t.split(':').collect();
         let start_h: u32 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -263,7 +460,6 @@ async fn do_sync(
         let now_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f64;
         let elapsed_secs = if now_secs >= slot_start_secs { now_secs - slot_start_secs } else { 0.0 };
 
-        // Build timeline durations to find current track
         let mut total_duration: f64 = 0.0;
         for t in &playlist {
             total_duration += t.duration as f64;
@@ -299,7 +495,6 @@ async fn do_sync(
         let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
     }
 
-    // Emit final ready (only if we have tracks and started playing)
     if first_track_started {
         let _ = handle.emit("sync-progress", serde_json::json!({
             "phase": "ready",
@@ -344,16 +539,24 @@ pub fn check_track_advancement(handle: &AppHandle) {
     }
 
     if !player.is_finished() {
-        // Track is still playing — reset consecutive_skips after 5s of real playback
         if player.get_position() > 5.0 {
             player.consecutive_skips = 0;
         }
         return;
     }
 
-    // Track finished - check if it played for a reasonable time
     let position = player.get_position();
+
+    // Record play report for finished track
     if let Some(track) = player.current_track() {
+        if position > 3.0 {
+            let cfg = config::AppConfig::load();
+            let zone_id = cfg.zone_id.as_deref().unwrap_or("");
+            let started_at = Utc::now().to_rfc3339();
+            db::save_play_report(&track.track_id, zone_id, &started_at, position as f64);
+            db::touch_track(&track.track_id);
+        }
+
         if position < 3.0 && track.duration > 5.0 {
             log::error!("Track '{}' finished after only {:.1}s (expected {:.0}s) - file may be corrupt: {}",
                 track.title, position, track.duration, track.file_path);
@@ -368,7 +571,6 @@ pub fn check_track_advancement(handle: &AppHandle) {
         }
     }
 
-    // Check if all tracks failed consecutively
     if player.consecutive_skips >= player.playlist_len() && player.playlist_len() > 0 {
         log::error!("All {} tracks failed to play. Stopping.", player.playlist_len());
         player.stop();
@@ -393,7 +595,6 @@ pub fn check_track_advancement(handle: &AppHandle) {
         }
     }
 
-    // Emit now-playing update
     if let Some(track) = player.current_track() {
         let _ = handle.emit("now-playing", serde_json::json!({
             "title": track.title,

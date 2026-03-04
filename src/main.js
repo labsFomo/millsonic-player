@@ -183,6 +183,23 @@ async function setupListeners() {
     }
   });
 
+  await listen('connection-status', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    const dot = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    if (data.status === 'online') {
+      dot.className = 'dot green';
+      text.textContent = 'En línea';
+    } else if (data.status === 'offline') {
+      dot.className = 'dot yellow';
+      text.textContent = 'Sin conexión (caché)';
+    } else if (data.status === 'emergency') {
+      dot.className = 'dot red';
+      text.textContent = 'Modo emergencia';
+    }
+  });
+
   await listen('status-change', (event) => {
     const data = event.payload;
     if (data && data.playing !== undefined) {
@@ -228,6 +245,19 @@ async function init() {
       }
       if (status.artist) {
         document.getElementById('track-artist').textContent = status.artist;
+      }
+    }
+
+    // Set initial connection status
+    if (status.connectionStatus) {
+      const dot = document.getElementById('status-dot');
+      const text = document.getElementById('status-text');
+      if (status.connectionStatus === 'online') {
+        dot.className = 'dot green'; text.textContent = 'En línea';
+      } else if (status.connectionStatus === 'offline') {
+        dot.className = 'dot yellow'; text.textContent = 'Sin conexión (caché)';
+      } else if (status.connectionStatus === 'emergency') {
+        dot.className = 'dot red'; text.textContent = 'Modo emergencia';
       }
     }
 
