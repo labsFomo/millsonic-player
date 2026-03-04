@@ -39,12 +39,41 @@ async function pairDevice() {
 }
 
 // --- Unpair ---
-async function unpairDevice() {
+function unpairDevice() {
+  // Show password modal
+  let modal = document.getElementById('unpair-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'unpair-modal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+  modal.innerHTML = `
+    <div style="background:#111827;border-radius:16px;padding:24px;width:280px;text-align:center;">
+      <p style="font-size:14px;font-weight:600;margin-bottom:4px;">Desvincular dispositivo</p>
+      <p style="font-size:12px;color:#94A3B8;margin-bottom:16px;">Ingresá la contraseña de administrador</p>
+      <input type="password" id="unpair-pass" placeholder="Contraseña" style="width:100%;padding:10px;text-align:center;font-size:16px;background:#0A1628;border:1px solid #2A2F3E;border-radius:10px;color:white;outline:none;">
+      <p id="unpair-error" style="color:#EF4444;font-size:12px;min-height:18px;margin-top:6px;"></p>
+      <div style="display:flex;gap:8px;margin-top:12px;">
+        <button onclick="document.getElementById('unpair-modal').remove()" style="flex:1;padding:10px;background:#1E293B;border:none;border-radius:10px;color:#94A3B8;cursor:pointer;font-size:13px;">Cancelar</button>
+        <button onclick="confirmUnpair()" style="flex:1;padding:10px;background:#EF4444;border:none;border-radius:10px;color:white;cursor:pointer;font-size:13px;font-weight:600;">Desvincular</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  setTimeout(() => document.getElementById('unpair-pass').focus(), 100);
+  document.getElementById('unpair-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') confirmUnpair(); });
+}
+
+async function confirmUnpair() {
+  const pass = document.getElementById('unpair-pass').value;
+  if (pass !== 'remix2026') {
+    document.getElementById('unpair-error').textContent = 'Contraseña incorrecta';
+    document.getElementById('unpair-pass').value = '';
+    return;
+  }
   const invoke = getInvoke();
   if (!invoke) return;
-  if (!confirm('¿Desvincular este dispositivo?')) return;
   try {
     await invoke('unpair_device');
+    document.getElementById('unpair-modal')?.remove();
     isPaired = false;
     isPlaying = false;
     document.getElementById('player-screen').classList.add('hidden');
