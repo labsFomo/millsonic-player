@@ -155,6 +155,11 @@ document.getElementById('pairing-code')?.addEventListener('keydown', (e) => {
 // Wait for Tauri IPC bridge to be ready
 function waitForTauri(retries = 50) {
   if (window.__TAURI__) {
+    // Set version from Tauri
+    try {
+      const version = window.__TAURI__?.app?.getVersion;
+      if (version) version().then(v => { const el = document.getElementById('app-version'); if (el) el.textContent = 'v' + v; });
+    } catch(e) {}
     init();
   } else if (retries > 0) {
     setTimeout(() => waitForTauri(retries - 1), 100);
