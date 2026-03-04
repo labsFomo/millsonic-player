@@ -35,6 +35,7 @@ fn get_status() -> serde_json::Value {
 #[tauri::command]
 async fn pair_device(code: String) -> Result<serde_json::Value, String> {
     log::info!("pair_device called with code: {}", code);
+    log::info!("pair_device called with code: {}", code);
     let resp = api::pair_with_code(&code).await.map_err(|e| {
         log::error!("pair_device API error: {}", e);
         e.to_string()
