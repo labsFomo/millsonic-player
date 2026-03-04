@@ -4,10 +4,10 @@
   "identifier": "com.millsonic.player",
   "build": {
     "frontendDist": "../src",
-    "devUrl": "http://localhost:1420",
-    "withGlobalTauri": true
+    "devUrl": "http://localhost:1420"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Millsonic Player",
