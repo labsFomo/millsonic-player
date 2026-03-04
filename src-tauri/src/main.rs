@@ -47,10 +47,17 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
     }
 
     // Save pairing info to config
-    let device_id = resp.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // API returns: { deviceId, deviceToken, zoneId, tenantId, config }
+    let device_id = resp.get("deviceId").and_then(|v| v.as_str())
+        .or_else(|| resp.get("id").and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
     let device_token = resp.get("deviceToken").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let zone_id = resp.get("zone").and_then(|z| z.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
-    let zone_name = resp.get("zone").and_then(|z| z.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let zone_id = resp.get("zoneId").and_then(|v| v.as_str())
+        .or_else(|| resp.get("zone").and_then(|z| z.get("id")).and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
+    let zone_name = resp.get("zoneName").and_then(|v| v.as_str())
+        .or_else(|| resp.get("zone").and_then(|z| z.get("name")).and_then(|v| v.as_str()))
+        .map(|s| s.to_string());
 
     if device_id.is_some() && device_token.is_some() {
         log::info!("Pairing successful! device={} zone={}", 
