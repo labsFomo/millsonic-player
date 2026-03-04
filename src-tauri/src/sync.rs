@@ -168,6 +168,13 @@ async fn do_sync(
         }
     }
 
+    // Log playlist file status
+    for t in &playlist {
+        let exists = std::path::Path::new(&t.file_path).exists();
+        let size = std::fs::metadata(&t.file_path).map(|m| m.len()).unwrap_or(0);
+        log::info!("Playlist track: '{}' | file={} | exists={} | size={} bytes", t.title, t.file_path, exists, size);
+    }
+
     if !playlist.is_empty() {
         log::info!("Starting playback with {} tracks", playlist.len());
         let mut player = audio::player().lock().map_err(|e| e.to_string())?;
@@ -210,31 +217,68 @@ pub fn check_track_advancement(handle: &AppHandle) {
         Err(_) => return,
     };
 
-    if player.is_playing() && player.is_finished() {
-        if let Some(track) = player.current_track() {
-            log::info!("Track finished: '{}' by '{}'", track.title, track.artist);
+    if !player.is_playing() {
+        return;
+    }
+
+    if !player.is_finished() {
+        // Track is still playing — reset consecutive_skips after 5s of real playback
+        if player.get_position() > 5.0 {
+            player.consecutive_skips = 0;
         }
-        if player.advance() {
-            if let Some(track) = player.current_track() {
-                log::info!("Playing next: '{}' ({})", track.title, track.file_path);
+        return;
+    }
+
+    // Track finished - check if it played for a reasonable time
+    let position = player.get_position();
+    if let Some(track) = player.current_track() {
+        if position < 3.0 && track.duration > 5.0 {
+            log::error!("Track '{}' finished after only {:.1}s (expected {:.0}s) - file may be corrupt: {}",
+                track.title, position, track.duration, track.file_path);
+            if let Ok(meta) = std::fs::metadata(&track.file_path) {
+                log::error!("File size: {} bytes", meta.len());
+            } else {
+                log::error!("File does NOT exist: {}", track.file_path);
             }
-            if let Err(e) = player.play_current() {
-                log::error!("Error playing next track: {} — stopping playback", e);
-                player.stop();
-            }
+            player.consecutive_skips += 1;
         } else {
-            log::warn!("No more tracks to advance to — stopping");
-            player.stop();
+            player.consecutive_skips = 0;
         }
-        // Emit now-playing update
+    }
+
+    // Check if all tracks failed consecutively
+    if player.consecutive_skips >= player.playlist_len() && player.playlist_len() > 0 {
+        log::error!("All {} tracks failed to play. Stopping.", player.playlist_len());
+        player.stop();
+        let _ = handle.emit("now-playing", serde_json::json!({
+            "title": "Error de reproducción",
+            "artist": "No se pudieron reproducir las pistas",
+            "duration": 0,
+            "position": 0,
+            "artworkUrl": null,
+        }));
+        return;
+    }
+
+    log::info!("Track finished (pos={:.1}s), advancing...", position);
+    if player.advance() {
         if let Some(track) = player.current_track() {
-            let _ = handle.emit("now-playing", serde_json::json!({
-                "title": track.title,
-                "artist": track.artist,
-                "duration": track.duration,
-                "position": 0.0,
-                "artworkUrl": track.artwork_url,
-            }));
+            log::info!("Next track: '{}' by '{}' ({})", track.title, track.artist, track.file_path);
         }
+        if let Err(e) = player.play_current() {
+            log::error!("Error playing next track: {}", e);
+            player.consecutive_skips += 1;
+        }
+    }
+
+    // Emit now-playing update
+    if let Some(track) = player.current_track() {
+        let _ = handle.emit("now-playing", serde_json::json!({
+            "title": track.title,
+            "artist": track.artist,
+            "duration": track.duration,
+            "position": 0.0,
+            "artworkUrl": track.artwork_url,
+        }));
     }
 }
