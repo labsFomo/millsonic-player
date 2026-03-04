@@ -49,8 +49,8 @@ function unpairDevice() {
   modal.innerHTML = `
     <div style="background:#111827;border-radius:16px;padding:24px;width:280px;text-align:center;">
       <p style="font-size:14px;font-weight:600;margin-bottom:4px;">Desvincular dispositivo</p>
-      <p style="font-size:12px;color:#94A3B8;margin-bottom:16px;">Ingresá la contraseña de administrador</p>
-      <input type="password" id="unpair-pass" placeholder="Contraseña" style="width:100%;padding:10px;text-align:center;font-size:16px;background:#0A1628;border:1px solid #2A2F3E;border-radius:10px;color:white;outline:none;">
+      <p style="font-size:12px;color:#94A3B8;margin-bottom:16px;">Ingresá el instrumento de seguridad</p>
+      <input type="text" id="unpair-pass" placeholder="Ej: PIANO" autocomplete="off" style="width:100%;padding:10px;text-align:center;font-size:16px;background:#0A1628;border:1px solid #2A2F3E;border-radius:10px;color:white;outline:none;text-transform:uppercase;">
       <p id="unpair-error" style="color:#EF4444;font-size:12px;min-height:18px;margin-top:6px;"></p>
       <div style="display:flex;gap:8px;margin-top:12px;">
         <button onclick="document.getElementById('unpair-modal').remove()" style="flex:1;padding:10px;background:#1E293B;border:none;border-radius:10px;color:#94A3B8;cursor:pointer;font-size:13px;">Cancelar</button>
@@ -63,16 +63,12 @@ function unpairDevice() {
 }
 
 async function confirmUnpair() {
-  const pass = document.getElementById('unpair-pass').value;
-  if (pass !== 'remix2026') {
-    document.getElementById('unpair-error').textContent = 'Contraseña incorrecta';
-    document.getElementById('unpair-pass').value = '';
-    return;
-  }
+  const pass = document.getElementById('unpair-pass').value.trim();
+  if (!pass) return;
   const invoke = getInvoke();
   if (!invoke) return;
   try {
-    await invoke('unpair_device');
+    await invoke('unpair_device', { pin: pass });
     document.getElementById('unpair-modal')?.remove();
     isPaired = false;
     isPlaying = false;
@@ -84,6 +80,11 @@ async function confirmUnpair() {
     document.getElementById('track-title').textContent = '—';
     document.getElementById('track-artist').textContent = '—';
   } catch (e) {
+    if (String(e).includes('PIN_MISMATCH')) {
+      document.getElementById('unpair-error').textContent = 'Instrumento incorrecto';
+      document.getElementById('unpair-pass').value = '';
+      return;
+    }
     console.error('Unpair error:', e);
   }
 }

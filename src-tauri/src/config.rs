@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub paired: bool,
     pub hardware_id: Option<String>,
     pub timezone: Option<String>,
+    pub unpair_pin: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -27,6 +28,7 @@ impl Default for AppConfig {
             paired: false,
             hardware_id: None,
             timezone: None,
+            unpair_pin: None,
         }
     }
 }

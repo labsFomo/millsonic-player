@@ -60,14 +60,22 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
         .map(|s| s.to_string());
 
     if device_id.is_some() && device_token.is_some() {
-        log::info!("Pairing successful! device={} zone={}", 
-            device_id.as_deref().unwrap_or("?"), zone_name.as_deref().unwrap_or("?"));
+        // Generate random unpair PIN (musical instrument)
+        const INSTRUMENTS: &[&str] = &[
+            "TROMPETA", "MARACAS", "TIMBALES", "SAXOFÓN", "BONGÓ", "CHARANGO",
+            "GUITARRA", "PANDERO", "VIOLÍN", "FLAUTA", "TAMBOR", "PIANO",
+            "ARPA", "UKELELE", "BANJO",
+        ];
+        let pin = INSTRUMENTS[rand::random::<usize>() % INSTRUMENTS.len()].to_string();
+        log::info!("Pairing successful! device={} zone={} unpairPin={}",
+            device_id.as_deref().unwrap_or("?"), zone_name.as_deref().unwrap_or("?"), pin);
         config::AppConfig::update_and_save(|cfg| {
             cfg.device_id = device_id;
             cfg.device_token = device_token;
             cfg.zone_id = zone_id;
             cfg.zone_name = zone_name;
             cfg.paired = true;
+            cfg.unpair_pin = Some(pin.clone());
         })?;
         // Trigger immediate sync after successful pairing
         log::info!("Triggering immediate sync...");
@@ -80,20 +88,24 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn unpair_device() -> Result<(), String> {
-    log::info!("unpair_device called — clearing config and stopping playback");
-    // Stop playback
+async fn unpair_device(pin: String) -> Result<(), String> {
+    let cfg = config::AppConfig::load();
+    let expected = cfg.unpair_pin.unwrap_or_default();
+    if pin.trim().to_uppercase() != expected {
+        return Err("PIN_MISMATCH".to_string());
+    }
+    log::info!("unpair_device called — PIN verified, clearing config and stopping playback");
     if let Ok(mut player) = audio::player().lock() {
         player.stop();
         player.set_playlist(vec![]);
     }
-    // Clear config
     config::AppConfig::update_and_save(|cfg| {
         cfg.device_id = None;
         cfg.device_token = None;
         cfg.zone_id = None;
         cfg.zone_name = None;
         cfg.paired = false;
+        cfg.unpair_pin = None;
     })?;
     Ok(())
 }
