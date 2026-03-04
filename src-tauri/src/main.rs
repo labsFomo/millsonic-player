@@ -145,7 +145,9 @@ fn main() {
         .setup(|app| {
             // Load config and set initial volume
             let cfg = config::AppConfig::load();
+            log::info!("About to init audio...");
             let _ = audio::set_volume(cfg.volume);
+            log::info!("Audio initialized OK");
 
             // Start sync loop
             log::info!("Setting up sync loop...");
