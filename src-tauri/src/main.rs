@@ -148,6 +148,7 @@ fn main() {
             let _ = audio::set_volume(cfg.volume);
 
             // Start sync loop
+            log::info!("Setting up sync loop...");
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 sync::start_sync_loop(handle).await;

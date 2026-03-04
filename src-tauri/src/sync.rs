@@ -12,6 +12,7 @@ fn current_playlist_id() -> &'static std::sync::Mutex<Option<String>> {
 }
 
 pub async fn start_sync_loop(handle: AppHandle) {
+    log::info!("Sync loop started");
     loop {
         let cfg = config::AppConfig::load();
         if cfg.is_paired() {
