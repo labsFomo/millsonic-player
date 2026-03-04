@@ -55,6 +55,8 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
             cfg.zone_name = zone_name;
             cfg.paired = true;
         })?;
+        // Trigger immediate sync after successful pairing
+        sync::trigger_sync();
     }
 
     Ok(resp)

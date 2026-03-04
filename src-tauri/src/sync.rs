@@ -3,6 +3,19 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use chrono::Datelike;
 use chrono_tz;
+use tokio::sync::Notify;
+
+static SYNC_TRIGGER: std::sync::OnceLock<Notify> = std::sync::OnceLock::new();
+
+fn sync_trigger() -> &'static Notify {
+    SYNC_TRIGGER.get_or_init(|| Notify::new())
+}
+
+/// Call this to trigger an immediate sync (e.g. after pairing)
+pub fn trigger_sync() {
+    log::info!("Sync triggered manually");
+    sync_trigger().notify_one();
+}
 
 /// Track the current playlist ID to avoid restarting playback on re-sync
 static CURRENT_PLAYLIST_ID: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
@@ -27,7 +40,13 @@ pub async fn start_sync_loop(handle: AppHandle) {
             log::info!("Not paired, waiting...");
         }
 
-        tokio::time::sleep(Duration::from_secs(300)).await;
+        // Wait for either 300s or a manual trigger (e.g. after pairing)
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+            _ = sync_trigger().notified() => {
+                log::info!("Sync woken by trigger");
+            },
+        }
     }
 }
 

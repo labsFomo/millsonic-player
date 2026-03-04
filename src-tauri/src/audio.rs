@@ -243,6 +243,10 @@ pub fn toggle() -> Result<String, String> {
         p.pause();
         Ok("paused".into())
     } else {
+        if p.playlist.is_empty() {
+            log::warn!("Toggle play ignored: no playlist loaded");
+            return Ok("paused".into());
+        }
         p.resume();
         Ok("playing".into())
     }
