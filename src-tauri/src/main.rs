@@ -60,13 +60,9 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
         .map(|s| s.to_string());
 
     if device_id.is_some() && device_token.is_some() {
-        // Generate random unpair PIN (musical instrument)
-        const INSTRUMENTS: &[&str] = &[
-            "TROMPETA", "MARACAS", "TIMBALES", "SAXOFÓN", "BONGÓ", "CHARANGO",
-            "GUITARRA", "PANDERO", "VIOLÍN", "FLAUTA", "TAMBOR", "PIANO",
-            "ARPA", "UKELELE", "BANJO",
-        ];
-        let pin = INSTRUMENTS[rand::random::<usize>() % INSTRUMENTS.len()].to_string();
+        // Get unpairPin from API response (generated server-side)
+        let pin = resp.get("unpairPin").and_then(|v| v.as_str())
+            .unwrap_or("PIANO").to_string();
         log::info!("Pairing successful! device={} zone={} unpairPin={}",
             device_id.as_deref().unwrap_or("?"), zone_name.as_deref().unwrap_or("?"), pin);
         config::AppConfig::update_and_save(|cfg| {
