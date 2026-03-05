@@ -78,6 +78,12 @@ pub async fn start_ws_loop(handle: AppHandle) {
     // Init start time
     let _ = app_start_time();
     
+    // WS gateway removed from API — use HTTP polling exclusively
+    log::info!("WebSocket disabled, using HTTP polling only");
+    let _ = handle;
+    return;
+
+    #[allow(unreachable_code)]
     let backoff_steps = [5u64, 10, 30, 60];
     let mut backoff_idx = 0;
 
@@ -183,18 +189,12 @@ pub async fn start_ws_loop(handle: AppHandle) {
     }
 }
 
-/// HTTP polling fallback - runs when WS is disconnected
+/// HTTP polling - primary command/telemetry channel
 pub async fn start_http_polling_loop(_handle: AppHandle) {
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-
-        // Only poll when WS is disconnected
-        if is_ws_connected() {
-            continue;
-        }
-
         let cfg = config::AppConfig::load();
         if !cfg.is_paired() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
             continue;
         }
 
@@ -216,6 +216,8 @@ pub async fn start_http_polling_loop(_handle: AppHandle) {
             }
             Err(e) => log::error!("HTTP polling telemetry error: {}", e),
         }
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
 
@@ -243,7 +245,7 @@ fn build_telemetry() -> serde_json::Value {
         .map(|entries| entries.filter_map(|e| e.ok()).count())
         .unwrap_or(0);
 
-    let conn_status = if is_ws_connected() { "online" } else { "degraded" };
+    let conn_status = "online";
 
     if let Some(obj) = telem.as_object_mut() {
         obj.insert("uptime".to_string(), serde_json::json!(uptime));
