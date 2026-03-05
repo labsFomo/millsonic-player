@@ -2,10 +2,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use serde::Serialize;
 
-// We keep rodio types behind an Option so the struct is Send.
-// OutputStream is !Send, so we store a flag and recreate as needed.
-// For a headless VPS build, we make audio optional.
-
 #[derive(Serialize, Clone, Debug)]
 pub struct TrackInfo {
     pub track_id: String,
@@ -29,6 +25,14 @@ pub struct AudioPlayer {
     _stream_handle: Option<rodio::OutputStreamHandle>,
     audio_available: bool,
     pub consecutive_skips: usize,
+    // Crossfade support
+    crossfade_sink: Option<rodio::Sink>,
+    pub crossfade_active: bool,
+    crossfade_start: Option<Instant>,
+    crossfade_duration_secs: f32,
+    // Spot playback
+    pub playing_spot: bool,
+    pub tracks_since_last_spot: usize,
 }
 
 // Safety: OutputStream is !Send but we only access from one thread via Mutex
@@ -36,7 +40,6 @@ unsafe impl Send for AudioPlayer {}
 
 impl AudioPlayer {
     pub fn new() -> Self {
-        // Try to init audio output
         let (stream, handle, sink, available) = match rodio::OutputStream::try_default() {
             Ok((stream, handle)) => {
                 match rodio::Sink::try_new(&handle) {
@@ -68,6 +71,12 @@ impl AudioPlayer {
             _stream_handle: handle,
             audio_available: available,
             consecutive_skips: 0,
+            crossfade_sink: None,
+            crossfade_active: false,
+            crossfade_start: None,
+            crossfade_duration_secs: 3.0,
+            playing_spot: false,
+            tracks_since_last_spot: 0,
         }
     }
 
@@ -82,7 +91,6 @@ impl AudioPlayer {
             return Ok(());
         }
 
-        // Verify file exists and has content
         let metadata = std::fs::metadata(&track.file_path)
             .map_err(|e| format!("Cannot stat file {}: {}", track.file_path, e))?;
         log::info!("File size: {} bytes", metadata.len());
@@ -100,7 +108,11 @@ impl AudioPlayer {
         if let Some(ref sink) = self.sink {
             sink.stop();
         }
-        // Recreate sink
+        // Drop old crossfade sink if any
+        self.crossfade_sink = None;
+        self.crossfade_active = false;
+        self.crossfade_start = None;
+
         if let Some(ref handle) = self._stream_handle {
             match rodio::Sink::try_new(handle) {
                 Ok(new_sink) => {
@@ -113,6 +125,128 @@ impl AudioPlayer {
             }
         } else {
             return Err("No audio stream handle available".to_string());
+        }
+
+        self.is_playing = true;
+        self.play_started_at = Some(Instant::now());
+        self.pause_elapsed = 0.0;
+        Ok(())
+    }
+
+    /// Start crossfade: begin fading out current sink, create new sink with next track fading in
+    pub fn start_crossfade(&mut self, next_track: &TrackInfo) -> Result<(), String> {
+        if !self.audio_available {
+            return Ok(());
+        }
+
+        let file = std::fs::File::open(&next_track.file_path)
+            .map_err(|e| format!("Cannot open file {}: {}", next_track.file_path, e))?;
+        let reader = std::io::BufReader::new(file);
+        let source = rodio::Decoder::new(reader)
+            .map_err(|e| format!("Cannot decode audio {}: {}", next_track.file_path, e))?;
+
+        if let Some(ref handle) = self._stream_handle {
+            match rodio::Sink::try_new(handle) {
+                Ok(new_sink) => {
+                    new_sink.set_volume(0.0); // Start silent, will fade in
+                    new_sink.append(source);
+                    // Move current sink to crossfade_sink (will fade out)
+                    self.crossfade_sink = self.sink.take();
+                    self.sink = Some(new_sink);
+                    self.crossfade_active = true;
+                    self.crossfade_start = Some(Instant::now());
+                    log::info!("Crossfade started for '{}'", next_track.title);
+                    Ok(())
+                }
+                Err(e) => Err(format!("Cannot create crossfade sink: {}", e)),
+            }
+        } else {
+            Err("No audio stream handle".to_string())
+        }
+    }
+
+    /// Update crossfade volumes. Returns true if crossfade is complete.
+    pub fn update_crossfade(&mut self) -> bool {
+        if !self.crossfade_active {
+            return false;
+        }
+        let elapsed = match self.crossfade_start {
+            Some(start) => start.elapsed().as_secs_f32(),
+            None => return false,
+        };
+        let progress = (elapsed / self.crossfade_duration_secs).min(1.0);
+
+        // Fade in new sink
+        if let Some(ref sink) = self.sink {
+            sink.set_volume(self.volume * progress);
+        }
+        // Fade out old sink
+        if let Some(ref old_sink) = self.crossfade_sink {
+            old_sink.set_volume(self.volume * (1.0 - progress));
+        }
+
+        if progress >= 1.0 {
+            // Crossfade complete, drop old sink
+            if let Some(old) = self.crossfade_sink.take() {
+                old.stop();
+            }
+            self.crossfade_active = false;
+            self.crossfade_start = None;
+            log::info!("Crossfade complete");
+            return true;
+        }
+        false
+    }
+
+    pub fn reset_position(&mut self) {
+        self.play_started_at = Some(Instant::now());
+        self.pause_elapsed = 0.0;
+    }
+
+    pub fn set_crossfade_duration(&mut self, secs: f32) {
+        self.crossfade_duration_secs = secs;
+    }
+
+    /// Play a spot audio file (one-shot, not part of playlist)
+    pub fn play_spot_file(&mut self, file_path: &str) -> Result<(), String> {
+        log::info!("Playing spot: {}", file_path);
+        self.playing_spot = true;
+
+        if !self.audio_available {
+            self.is_playing = true;
+            self.play_started_at = Some(Instant::now());
+            self.pause_elapsed = 0.0;
+            return Ok(());
+        }
+
+        let metadata = std::fs::metadata(file_path)
+            .map_err(|e| format!("Cannot stat spot file {}: {}", file_path, e))?;
+        if metadata.len() < 500 {
+            self.playing_spot = false;
+            return Err(format!("Spot file too small: {}", file_path));
+        }
+
+        let file = std::fs::File::open(file_path)
+            .map_err(|e| format!("Cannot open spot file {}: {}", file_path, e))?;
+        let reader = std::io::BufReader::new(file);
+        let source = rodio::Decoder::new(reader)
+            .map_err(|e| format!("Cannot decode spot {}: {}", file_path, e))?;
+
+        if let Some(ref sink) = self.sink {
+            sink.stop();
+        }
+        if let Some(ref handle) = self._stream_handle {
+            match rodio::Sink::try_new(handle) {
+                Ok(new_sink) => {
+                    new_sink.set_volume(self.volume);
+                    new_sink.append(source);
+                    self.sink = Some(new_sink);
+                }
+                Err(e) => {
+                    self.playing_spot = false;
+                    return Err(format!("Cannot create sink for spot: {}", e));
+                }
+            }
         }
 
         self.is_playing = true;
@@ -146,9 +280,15 @@ impl AudioPlayer {
         if let Some(ref sink) = self.sink {
             sink.stop();
         }
+        if let Some(ref old) = self.crossfade_sink {
+            old.stop();
+        }
+        self.crossfade_sink = None;
+        self.crossfade_active = false;
         self.is_playing = false;
         self.play_started_at = None;
         self.pause_elapsed = 0.0;
+        self.playing_spot = false;
     }
 
     pub fn set_volume(&mut self, vol: u8) {
@@ -164,7 +304,6 @@ impl AudioPlayer {
 
     pub fn is_finished(&self) -> bool {
         if !self.audio_available {
-            // Simulate: track ends after its duration
             if let Some(track) = self.current_track() {
                 return self.get_position() >= track.duration;
             }
@@ -210,10 +349,19 @@ impl AudioPlayer {
             self.current_index += 1;
             true
         } else {
-            // Loop back to start
             self.current_index = 0;
             !self.playlist.is_empty()
         }
+    }
+
+    /// Get the next track without advancing
+    pub fn peek_next(&self) -> Option<&TrackInfo> {
+        let next = if self.current_index + 1 < self.playlist.len() {
+            self.current_index + 1
+        } else {
+            0
+        };
+        self.playlist.get(next)
     }
 
     pub fn playlist_len(&self) -> usize {

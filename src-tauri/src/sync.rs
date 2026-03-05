@@ -307,9 +307,37 @@ async fn do_sync(
 
     // Save timezone in config for offline use
     let tz_owned = tz_str.to_string();
+
+    // Parse crossfade config from zone
+    let crossfade_enabled = sync_data.get("zone")
+        .and_then(|z| z.get("crossfadeEnabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let crossfade_duration = sync_data.get("zone")
+        .and_then(|z| z.get("crossfadeDuration"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as u32;
+
     config::update_and_save_global(|c| {
         c.timezone = Some(tz_owned.clone());
+        c.crossfade_enabled = crossfade_enabled;
+        c.crossfade_duration = crossfade_duration;
     });
+
+    // Apply crossfade duration to audio player
+    if let Ok(mut player) = audio::player().lock() {
+        player.set_crossfade_duration(crossfade_duration as f32);
+    }
+
+    // Parse and download spots
+    let spots = sync_data.get("spots").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if !spots.is_empty() {
+        log::info!("Sync contains {} spots", spots.len());
+        download_and_save_spots(&spots).await;
+    } else {
+        // Clear spots if none in sync
+        db::save_spot_schedules(&[]);
+    }
 
     // Parse schedule and save to SQLite
     let schedule = sync_data.get("schedule").cloned().unwrap_or(serde_json::json!([]));
@@ -528,6 +556,95 @@ async fn refresh_track_cache(tracks: &[serde_json::Value]) {
     }
 }
 
+async fn download_and_save_spots(spots: &[serde_json::Value]) {
+    let cache_dir = config::AppConfig::data_dir().join("cache").join("spots");
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    let mut spots_with_paths: Vec<serde_json::Value> = Vec::new();
+
+    for spot in spots {
+        let id = spot.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let audio_url = spot.get("audioUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let name = spot.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+
+        let file_path = cache_dir.join(format!("{}.mp3", id));
+
+        if !file_path.exists() && !audio_url.is_empty() {
+            log::info!("Downloading spot: {} - {}", id, name);
+            match api::download_track(audio_url, &file_path).await {
+                Ok(_) => log::info!("Downloaded spot: {}", name),
+                Err(e) => {
+                    log::error!("Failed to download spot {}: {}", name, e);
+                    // Still save without file_path
+                    spots_with_paths.push(spot.clone());
+                    continue;
+                }
+            }
+        }
+
+        let mut s = spot.clone();
+        if file_path.exists() {
+            if let Some(obj) = s.as_object_mut() {
+                obj.insert("_filePath".to_string(), serde_json::json!(file_path.to_string_lossy().to_string()));
+            }
+        }
+        spots_with_paths.push(s);
+    }
+
+    db::save_spot_schedules(&spots_with_paths);
+}
+
+/// Check if a spot should play based on schedule rules
+fn find_eligible_spot(tz: &chrono_tz::Tz) -> Option<String> {
+    let now = Utc::now().with_timezone(tz);
+    let day_of_week = now.weekday().num_days_from_monday();
+    let current_time = now.format("%H:%M").to_string();
+    let current_date = now.format("%Y-%m-%d").to_string();
+
+    let spots = db::load_spot_schedules();
+
+    for (id, days_json, start_time, end_time, track_freq, _freq, start_date, end_date, file_path) in &spots {
+        // Check file exists
+        if !std::path::Path::new(file_path).exists() {
+            continue;
+        }
+
+        // Check track frequency
+        if let Ok(player) = audio::player().lock() {
+            if player.tracks_since_last_spot < *track_freq as usize {
+                continue;
+            }
+        }
+
+        // Check day of week
+        let days: Vec<u32> = serde_json::from_str(days_json).unwrap_or_default();
+        if !days.is_empty() && !days.contains(&day_of_week) {
+            continue;
+        }
+
+        // Check time range
+        if current_time.as_str() < start_time.as_str() || current_time.as_str() >= end_time.as_str() {
+            continue;
+        }
+
+        // Check date range
+        if let Some(sd) = start_date {
+            if !sd.is_empty() && current_date.as_str() < sd.as_str() {
+                continue;
+            }
+        }
+        if let Some(ed) = end_date {
+            if !ed.is_empty() && current_date.as_str() > ed.as_str() {
+                continue;
+            }
+        }
+
+        log::info!("Spot eligible: {} (file: {})", id, file_path);
+        return Some(file_path.clone());
+    }
+    None
+}
+
 /// Called from main.rs every second to check if track ended and advance
 pub fn check_track_advancement(handle: &AppHandle) {
     let mut player = match audio::player().lock() {
@@ -539,6 +656,48 @@ pub fn check_track_advancement(handle: &AppHandle) {
         return;
     }
 
+    // Update crossfade volumes if active
+    player.update_crossfade();
+
+    // Check crossfade trigger: if near end of track and crossfade enabled
+    let cfg = config::AppConfig::load();
+    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot {
+        // Clone track info to avoid borrow conflicts
+        let track_info = player.current_track().cloned();
+        let next_info = player.peek_next().cloned();
+        if let (Some(track), Some(next)) = (track_info, next_info) {
+            let position = player.get_position();
+            let crossfade_point = track.duration - cfg.crossfade_duration as f32;
+            if crossfade_point > 0.0 && position >= crossfade_point && !player.is_finished() {
+                log::info!("Starting crossfade at {:.1}s (track duration {:.1}s)", position, track.duration);
+                if let Err(e) = player.start_crossfade(&next) {
+                    log::error!("Crossfade failed: {}", e);
+                } else {
+                    // Record play report for outgoing track
+                    let zone_id = cfg.zone_id.as_deref().unwrap_or("");
+                    let started_at = Utc::now().to_rfc3339();
+                    db::save_play_report(&track.track_id, zone_id, &started_at, position as f64);
+                    db::touch_track(&track.track_id);
+                    // Advance index
+                    player.advance();
+                    player.tracks_since_last_spot += 1;
+                    player.reset_position();
+                    // Emit now-playing for new track
+                    if let Some(t) = player.current_track() {
+                        let _ = handle.emit("now-playing", serde_json::json!({
+                            "title": t.title,
+                            "artist": t.artist,
+                            "duration": t.duration,
+                            "position": 0.0,
+                            "artworkUrl": t.artwork_url,
+                        }));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     if !player.is_finished() {
         if player.get_position() > 5.0 {
             player.consecutive_skips = 0;
@@ -548,10 +707,29 @@ pub fn check_track_advancement(handle: &AppHandle) {
 
     let position = player.get_position();
 
+    // If a spot just finished, resume normal playback
+    if player.playing_spot {
+        log::info!("Spot finished, resuming normal playback");
+        player.playing_spot = false;
+        player.tracks_since_last_spot = 0;
+        if let Err(e) = player.play_current() {
+            log::error!("Error resuming after spot: {}", e);
+        }
+        if let Some(track) = player.current_track() {
+            let _ = handle.emit("now-playing", serde_json::json!({
+                "title": track.title,
+                "artist": track.artist,
+                "duration": track.duration,
+                "position": 0.0,
+                "artworkUrl": track.artwork_url,
+            }));
+        }
+        return;
+    }
+
     // Record play report for finished track
     if let Some(track) = player.current_track() {
         if position > 3.0 {
-            let cfg = config::AppConfig::load();
             let zone_id = cfg.zone_id.as_deref().unwrap_or("");
             let started_at = Utc::now().to_rfc3339();
             db::save_play_report(&track.track_id, zone_id, &started_at, position as f64);
@@ -583,6 +761,32 @@ pub fn check_track_advancement(handle: &AppHandle) {
             "artworkUrl": null,
         }));
         return;
+    }
+
+    // Increment track counter
+    player.tracks_since_last_spot += 1;
+
+    // Check if a spot should play before next track
+    let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
+    let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
+    if let Some(spot_path) = find_eligible_spot(&tz) {
+        log::info!("Playing spot before next track (tracks since last: {})", player.tracks_since_last_spot);
+        match player.play_spot_file(&spot_path) {
+            Ok(_) => {
+                let _ = handle.emit("now-playing", serde_json::json!({
+                    "title": "📢 Spot",
+                    "artist": "Anuncio",
+                    "duration": 0,
+                    "position": 0.0,
+                    "artworkUrl": null,
+                }));
+                return;
+            }
+            Err(e) => {
+                log::error!("Failed to play spot: {}", e);
+                // Fall through to normal track advancement
+            }
+        }
     }
 
     log::info!("Track finished (pos={:.1}s), advancing...", position);

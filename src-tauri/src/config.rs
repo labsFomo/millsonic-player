@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub hardware_id: Option<String>,
     pub timezone: Option<String>,
     pub unpair_pin: Option<String>,
+    pub crossfade_enabled: bool,
+    pub crossfade_duration: u32,
 }
 
 impl Default for AppConfig {
@@ -29,6 +31,8 @@ impl Default for AppConfig {
             hardware_id: None,
             timezone: None,
             unpair_pin: None,
+            crossfade_enabled: false,
+            crossfade_duration: 3,
         }
     }
 }

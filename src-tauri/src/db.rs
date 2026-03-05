@@ -53,6 +53,22 @@ fn init_tables(conn: &Connection) {
             key TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS spot_schedules (
+            id TEXT PRIMARY KEY,
+            spot_id TEXT NOT NULL,
+            name TEXT,
+            audio_url TEXT,
+            tts_text TEXT,
+            days_of_week TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            frequency INTEGER DEFAULT 0,
+            track_frequency INTEGER DEFAULT 4,
+            start_date TEXT,
+            end_date TEXT,
+            file_path TEXT,
+            synced_at TEXT DEFAULT (datetime('now'))
+        );
     ").expect("Cannot create tables");
 }
 
@@ -288,6 +304,65 @@ pub fn cleanup_cache() {
             break;
         }
     }
+}
+
+/// Save spot schedules from sync response
+pub fn save_spot_schedules(spots: &[serde_json::Value]) {
+    let conn = match db().lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = conn.execute("DELETE FROM spot_schedules", []);
+    for spot in spots {
+        let id = spot.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let spot_id = spot.get("spotId").and_then(|v| v.as_str()).unwrap_or("");
+        let name = spot.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let audio_url = spot.get("audioUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let tts_text = spot.get("ttsText").and_then(|v| v.as_str()).unwrap_or("");
+        let days_of_week = spot.get("daysOfWeek")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "[]".to_string());
+        let start_time = spot.get("startTime").and_then(|v| v.as_str()).unwrap_or("00:00");
+        let end_time = spot.get("endTime").and_then(|v| v.as_str()).unwrap_or("23:59");
+        let frequency = spot.get("frequency").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let track_frequency = spot.get("trackFrequency").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
+        let start_date = spot.get("startDate").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let end_date = spot.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let file_path = spot.get("_filePath").and_then(|v| v.as_str()).unwrap_or("");
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO spot_schedules (id, spot_id, name, audio_url, tts_text, days_of_week, start_time, end_time, frequency, track_frequency, start_date, end_date, file_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![id, spot_id, name, audio_url, tts_text, days_of_week, start_time, end_time, frequency, track_frequency, start_date, end_date, file_path],
+        );
+    }
+}
+
+/// Load all spot schedules from DB
+pub fn load_spot_schedules() -> Vec<(String, String, String, String, i32, i32, Option<String>, Option<String>, String)> {
+    let conn = match db().lock() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, days_of_week, start_time, end_time, track_frequency, frequency, start_date, end_date, file_path FROM spot_schedules WHERE file_path IS NOT NULL AND file_path != ''"
+    ) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i32>(4)?,
+            row.get::<_, i32>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    }).ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
 }
 
 /// Save a config value
