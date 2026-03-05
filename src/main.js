@@ -200,6 +200,16 @@ async function setupListeners() {
     }
   });
 
+  await listen('ws-status', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    const wsDot = document.getElementById('ws-dot');
+    if (wsDot) {
+      wsDot.className = data.status === 'connected' ? 'dot green' : 'dot red';
+      wsDot.title = 'WS: ' + data.status;
+    }
+  });
+
   await listen('status-change', (event) => {
     const data = event.payload;
     if (data && data.playing !== undefined) {

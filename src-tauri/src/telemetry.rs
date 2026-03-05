@@ -49,6 +49,11 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
             continue;
         }
 
+        // Skip HTTP telemetry when WS is connected (WS sends its own)
+        if crate::ws::is_ws_connected() {
+            continue;
+        }
+
         let device_id = cfg.device_id.clone().unwrap();
         let device_token = cfg.device_token.clone().unwrap();
         let telemetry = get_telemetry();
@@ -84,8 +89,7 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
             let _ = player.skip_track();
         }
         "forceSync" => {
-            // TODO: trigger immediate sync
-            log::info!("Force sync requested");
+            crate::sync::trigger_sync();
         }
         _ => log::warn!("Unknown command: {}", cmd),
     }

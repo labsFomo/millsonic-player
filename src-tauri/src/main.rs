@@ -6,6 +6,7 @@ mod sync;
 mod config;
 mod telemetry;
 mod api;
+mod ws;
 
 use tauri::{Manager, Emitter};
 use std::time::Duration;
@@ -214,10 +215,22 @@ fn main() {
                 sync::start_report_flusher().await;
             });
 
-            // Start telemetry loop
+            // Start telemetry loop (HTTP fallback, runs when WS is down)
             let handle2 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 telemetry::start_telemetry_loop(handle2).await;
+            });
+
+            // Start WebSocket connection
+            let handle_ws = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                ws::start_ws_loop(handle_ws).await;
+            });
+
+            // Start HTTP polling fallback (active when WS is disconnected)
+            let handle_poll = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                ws::start_http_polling_loop(handle_poll).await;
             });
 
             // Start now-playing emitter + track advancement check (every 1s)
