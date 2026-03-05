@@ -303,6 +303,14 @@ impl AudioPlayer {
     }
 
     pub fn is_finished(&self) -> bool {
+        // Position-based fallback: if position >= duration - 0.5s, consider finished
+        // This handles cases where rodio sink.empty() doesn't return true reliably
+        if let Some(track) = self.current_track() {
+            if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
+                return true;
+            }
+        }
+
         if !self.audio_available {
             if let Some(track) = self.current_track() {
                 return self.get_position() >= track.duration;
