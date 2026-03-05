@@ -177,7 +177,8 @@ fn handle_offline_fallback(handle: &AppHandle, cfg: &config::AppConfig) {
     let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
     let now = Utc::now().with_timezone(&tz);
-    let day_of_week = now.weekday().num_days_from_sunday();
+    // API uses luxon: 0=Mon..6=Sun. chrono: num_days_from_monday() gives 0=Mon..6=Sun
+    let day_of_week = now.weekday().num_days_from_monday();
 
     let cached_slots = db::load_schedule(zone_id, day_of_week);
     let current_time = now.format("%H:%M").to_string();
@@ -317,8 +318,8 @@ async fn do_sync(
     let zone_id = config::AppConfig::load().zone_id.clone().unwrap_or_default();
     db::save_schedule(&zone_id, &slots);
 
-    // API uses 0=Sunday, 1=Monday...6=Saturday
-    let day_of_week = now.weekday().num_days_from_sunday();
+    // API uses luxon: 0=Mon..6=Sun. chrono: num_days_from_monday() gives 0=Mon..6=Sun
+    let day_of_week = now.weekday().num_days_from_monday();
     let current_time = now.format("%H:%M").to_string();
 
     log::info!("Looking for schedule: dayOfWeek={}, time={}", day_of_week, current_time);
