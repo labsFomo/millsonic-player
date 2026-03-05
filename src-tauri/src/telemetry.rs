@@ -74,8 +74,15 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
         match api::send_telemetry(&device_id, &device_token, &telemetry).await {
             Ok(resp) => {
                 // Handle pending commands
-                if let Some(cmd) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
-                    handle_command(cmd, &resp);
+                if let Some(cmd_raw) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
+                    // pendingCommand is JSON string: {"command":"pause","value":null}
+                    if let Ok(cmd_obj) = serde_json::from_str::<serde_json::Value>(cmd_raw) {
+                        let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        handle_command(cmd, &cmd_obj);
+                    } else {
+                        // Fallback: treat as plain command string
+                        handle_command(cmd_raw, &resp);
+                    }
                 }
             }
             Err(e) => log::error!("Telemetry error: {}", e),
@@ -94,7 +101,7 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
         "play" => player.resume(),
         "pause" => player.pause(),
         "setVolume" => {
-            if let Some(val) = resp.get("commandValue").and_then(|v| v.as_u64()) {
+            if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
                 player.set_volume(val as u8);
             }
         }
