@@ -649,7 +649,10 @@ fn find_eligible_spot(tz: &chrono_tz::Tz) -> Option<String> {
 pub fn check_track_advancement(handle: &AppHandle) {
     let mut player = match audio::player().lock() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(poisoned) => {
+            log::error!("Audio mutex poisoned! Recovering...");
+            poisoned.into_inner()
+        },
     };
 
     if !player.is_playing() {
@@ -701,6 +704,11 @@ pub fn check_track_advancement(handle: &AppHandle) {
     if !player.is_finished() {
         if player.get_position() > 5.0 {
             player.consecutive_skips = 0;
+        }
+        // Log position every 30s for debugging
+        let pos = player.get_position();
+        if pos > 0.0 && (pos as u32) % 30 == 0 {
+            log::info!("Still playing at {:.0}s", pos);
         }
         return;
     }
