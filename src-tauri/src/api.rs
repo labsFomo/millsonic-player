@@ -4,7 +4,11 @@ use std::path::Path;
 const API_BASE: &str = "https://apimillsonic.fo.com.uy/api/v1";
 
 fn client() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 #[derive(Serialize)]
@@ -95,7 +99,12 @@ pub async fn download_track(url: &str, dest_path: &Path) -> Result<(), Box<dyn s
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let resp = client().get(url).send().await?;
+    let download_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let resp = download_client.get(url).send().await?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

@@ -37,19 +37,25 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
     log::info!("WS command: {} data={}", cmd, data);
     match cmd {
         "play" => {
-            if let Ok(mut p) = audio::player().lock() {
+            if let Ok(mut p) = audio::player().try_lock() {
                 p.resume();
+            } else {
+                log::warn!("Could not lock audio player for play command (busy)");
             }
         }
         "pause" => {
-            if let Ok(mut p) = audio::player().lock() {
+            if let Ok(mut p) = audio::player().try_lock() {
                 p.pause();
+            } else {
+                log::warn!("Could not lock audio player for pause command (busy)");
             }
         }
         "setVolume" => {
             if let Some(vol) = data.get("value").and_then(|v| v.as_u64()) {
-                if let Ok(mut p) = audio::player().lock() {
+                if let Ok(mut p) = audio::player().try_lock() {
                     p.set_volume(vol as u8);
+                } else {
+                    log::warn!("Could not lock audio player for setVolume (busy)");
                 }
                 let _ = config::AppConfig::update_and_save(|cfg| {
                     cfg.volume = vol as u8;
@@ -60,8 +66,10 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
             sync::trigger_sync();
         }
         "skipTrack" => {
-            if let Ok(mut p) = audio::player().lock() {
+            if let Ok(mut p) = audio::player().try_lock() {
                 let _ = p.skip_track();
+            } else {
+                log::warn!("Could not lock audio player for skipTrack (busy)");
             }
         }
         "restart" => {
@@ -191,28 +199,34 @@ pub async fn start_ws_loop(handle: AppHandle) {
 
 /// HTTP polling - primary command/telemetry channel
 pub async fn start_http_polling_loop(_handle: AppHandle) {
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         let cfg = config::AppConfig::load();
         if !cfg.is_paired() {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            consecutive_failures = 0;
             continue;
         }
 
         let device_id = cfg.device_id.clone().unwrap();
         let device_token = cfg.device_token.clone().unwrap();
 
-        // Send telemetry via HTTP and check for pending commands
+        // Send telemetry via HTTP with timeout — NEVER block
         let telem = build_telemetry();
-        match api::send_telemetry(&device_id, &device_token, &telem).await {
-            Ok(resp) => {
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            api::send_telemetry(&device_id, &device_token, &telem),
+        ).await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                consecutive_failures = 0;
                 if let Some(pending) = resp.get("pendingCommand") {
-                    // API may return pendingCommand as object {command, value} or as JSON string
                     let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
-                        // Already a JSON object: { "command": "pause", "value": null }
                         let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
                         (cmd.to_string(), pending.clone())
                     } else if let Some(cmd_str) = pending.as_str() {
-                        // JSON string that needs parsing
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cmd_str) {
                             let cmd = parsed.get("command").and_then(|c| c.as_str()).unwrap_or(cmd_str);
                             (cmd.to_string(), parsed)
@@ -226,20 +240,42 @@ pub async fn start_http_polling_loop(_handle: AppHandle) {
                     if !command.is_empty() {
                         log::info!("Executing pending command: {}", command);
                         execute_command(&command, &cmd_data);
-                        let _ = ack_command_http(&device_id, &device_token, &resp).await;
+                        // Ack with timeout too
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            ack_command_http(&device_id, &device_token, &resp),
+                        ).await;
                     }
                 }
             }
-            Err(e) => log::error!("HTTP polling telemetry error: {}", e),
+            Ok(Err(e)) => {
+                consecutive_failures += 1;
+                log::error!("HTTP polling telemetry error: {} (failures: {})", e, consecutive_failures);
+            }
+            Err(_) => {
+                consecutive_failures += 1;
+                log::warn!("HTTP polling telemetry timed out (failures: {})", consecutive_failures);
+            }
         }
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // Exponential backoff: 10s → 20s → 30s → max 60s
+        let wait = match consecutive_failures {
+            0 => 10,
+            1 => 10,
+            2 => 20,
+            3 => 30,
+            _ => 60,
+        };
+        tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }
 
 async fn ack_command_http(device_id: &str, device_token: &str, resp: &serde_json::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cmd_id = resp.get("commandId").and_then(|v| v.as_str()).unwrap_or("");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     client.post(format!("https://apimillsonic.fo.com.uy/api/v1/devices/{}/command-ack", device_id))
         .json(&serde_json::json!({
             "deviceToken": device_token,

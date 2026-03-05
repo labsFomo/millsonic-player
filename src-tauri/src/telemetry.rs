@@ -10,7 +10,8 @@ pub fn get_telemetry() -> serde_json::Value {
     let total_mem = sys.total_memory() as f64 / 1_048_576.0;
     let used_mem = sys.used_memory() as f64 / 1_048_576.0;
 
-    let player = audio::player().lock().ok();
+    // Use try_lock to never block audio thread
+    let player = audio::player().try_lock().ok();
     let is_playing = player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
     let current_track_id = player
         .as_ref()
@@ -54,24 +55,38 @@ fn get_disk_total() -> f64 {
 }
 
 pub async fn start_telemetry_loop(_handle: AppHandle) {
+    let mut consecutive_failures: u32 = 0;
+
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Exponential backoff interval: 60s base, up to 120s on failures
+        let interval = match consecutive_failures {
+            0 => 60,
+            1 => 60,
+            2 => 80,
+            3 => 100,
+            _ => 120,
+        };
+        tokio::time::sleep(Duration::from_secs(interval)).await;
 
         let cfg = config::AppConfig::load();
         if !cfg.is_paired() {
+            consecutive_failures = 0;
             continue;
         }
-
-        // WS is disabled, HTTP polling handles commands in ws.rs
-        // This loop is supplementary telemetry only
 
         let device_id = cfg.device_id.clone().unwrap();
         let device_token = cfg.device_token.clone().unwrap();
         let telemetry = get_telemetry();
 
-        match api::send_telemetry(&device_id, &device_token, &telemetry).await {
-            Ok(resp) => {
-                // Handle pending commands (API returns object or string)
+        // Wrap in timeout — NEVER block
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            api::send_telemetry(&device_id, &device_token, &telemetry),
+        ).await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                consecutive_failures = 0;
                 if let Some(pending) = resp.get("pendingCommand") {
                     let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
                         let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -91,16 +106,26 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
                     }
                 }
             }
-            Err(e) => log::error!("Telemetry error: {}", e),
+            Ok(Err(e)) => {
+                consecutive_failures += 1;
+                log::error!("Telemetry error: {} (failures: {})", e, consecutive_failures);
+            }
+            Err(_) => {
+                consecutive_failures += 1;
+                log::warn!("Telemetry request timed out (failures: {})", consecutive_failures);
+            }
         }
     }
 }
 
 fn handle_command(cmd: &str, resp: &serde_json::Value) {
     log::info!("Executing remote command: {}", cmd);
-    let mut player = match audio::player().lock() {
+    let mut player = match audio::player().try_lock() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => {
+            log::warn!("Could not lock audio player for command '{}' (busy)", cmd);
+            return;
+        }
     };
 
     match cmd {

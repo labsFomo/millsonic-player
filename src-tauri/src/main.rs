@@ -12,11 +12,12 @@ use tauri::{Manager, Emitter};
 use std::time::Duration;
 use simplelog::{CombinedLogger, WriteLogger, LevelFilter, Config as LogConfig};
 use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[tauri::command]
 fn get_status() -> serde_json::Value {
     let cfg = config::AppConfig::load();
-    let player = audio::player().lock().ok();
+    let player = audio::player().try_lock().ok();
     let is_playing = player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
     let volume = player.as_ref().map(|p| p.get_volume()).unwrap_or(80);
     let track = player.as_ref().and_then(|p| p.current_track().map(|t| t.title.clone()));
@@ -129,7 +130,7 @@ fn toggle_playback() -> Result<String, String> {
 
 #[tauri::command]
 fn get_now_playing() -> serde_json::Value {
-    let player = match audio::player().lock() {
+    let player = match audio::player().try_lock() {
         Ok(p) => p,
         Err(_) => return serde_json::json!(null),
     };
@@ -156,6 +157,40 @@ fn get_logs() -> String {
             lines[start..].join("\n")
         }
         Err(e) => format!("Cannot read log: {}", e),
+    }
+}
+
+/// Global atomics for watchdog: track audio position (centiseconds)
+static WATCHDOG_LAST_POSITION: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_STUCK_COUNT: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_PREV_POSITION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[tauri::command]
+fn install_launch_agent() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_content = include_str!("../../resources/com.millsonic.player.plist");
+        let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+        let dest = home.join("Library/LaunchAgents/com.millsonic.player.plist");
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&dest, plist_content).map_err(|e| e.to_string())?;
+        // Load the agent
+        let output = std::process::Command::new("launchctl")
+            .args(["load", "-w", &dest.to_string_lossy()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok("LaunchAgent installed and loaded".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!("LaunchAgent installed, launchctl: {}", stderr))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("LaunchAgent is only supported on macOS".to_string())
     }
 }
 
@@ -195,6 +230,7 @@ fn main() {
             toggle_playback,
             get_now_playing,
             get_logs,
+            install_launch_agent,
         ])
         .setup(|app| {
             // Load config and set initial volume
@@ -234,27 +270,105 @@ fn main() {
             });
 
             // Start now-playing emitter + track advancement check (every 1s)
+            // This is the ONLY task that does blocking .lock() on audio player
             let handle3 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
 
-                    // Check track advancement
-                    sync::check_track_advancement(&handle3);
+                    // Wrap in catch_unwind so a panic doesn't kill the app
+                    let handle_ref = &handle3;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // Check track advancement
+                        sync::check_track_advancement(handle_ref);
 
-                    // Emit now-playing
-                    if let Ok(player) = audio::player().lock() {
-                        if player.is_playing() {
-                            if let Some(track) = player.current_track() {
-                                let _ = handle3.emit("now-playing", serde_json::json!({
-                                    "title": track.title,
-                                    "artist": track.artist,
-                                    "duration": track.duration,
-                                    "position": player.get_position(),
-                                    "artworkUrl": track.artwork_url,
-                                }));
+                        // Emit now-playing + update watchdog position
+                        if let Ok(player) = audio::player().lock() {
+                            let pos = player.get_position();
+                            WATCHDOG_LAST_POSITION.store((pos * 100.0) as u64, Ordering::Relaxed);
+
+                            if player.is_playing() {
+                                if let Some(track) = player.current_track() {
+                                    let _ = handle_ref.emit("now-playing", serde_json::json!({
+                                        "title": track.title,
+                                        "artist": track.artist,
+                                        "duration": track.duration,
+                                        "position": pos,
+                                        "artworkUrl": track.artwork_url,
+                                    }));
+                                }
                             }
                         }
+                    }));
+
+                    if let Err(e) = result {
+                        log::error!("PANIC in audio advancement loop: {:?}", e);
+                    }
+                }
+            });
+
+            // Watchdog: checks every 30s if audio is progressing
+            let handle_wd = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Give the app time to start up
+                tokio::time::sleep(Duration::from_secs(60)).await;
+
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let is_playing = audio::player().try_lock()
+                            .map(|p| p.is_playing() && p.playlist_len() > 0)
+                            .unwrap_or(false);
+
+                        if !is_playing {
+                            WATCHDOG_STUCK_COUNT.store(0, Ordering::Relaxed);
+                            return;
+                        }
+
+                        let current_pos = WATCHDOG_LAST_POSITION.load(Ordering::Relaxed);
+                        let prev_pos = WATCHDOG_PREV_POSITION.swap(current_pos, Ordering::Relaxed);
+
+                        // If position changed, reset stuck counter
+                        if current_pos != prev_pos {
+                            WATCHDOG_STUCK_COUNT.store(0, Ordering::Relaxed);
+                            return;
+                        }
+
+                        let stuck = WATCHDOG_STUCK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                        if stuck >= 2 {
+                            // Stuck for >60s (2 checks × 30s), force restart playback
+                            log::error!("WATCHDOG: Audio stuck for >60s at position {}cs, force-restarting!", current_pos);
+                            if let Ok(mut player) = audio::player().lock() {
+                                // Force stop current playback
+                                player.stop();
+                                // Advance to next track
+                                if player.advance() {
+                                    if let Err(e) = player.play_current() {
+                                        log::error!("WATCHDOG: Failed to restart playback: {}", e);
+                                    } else {
+                                        log::info!("WATCHDOG: Playback restarted successfully");
+                                        if let Some(track) = player.current_track() {
+                                            let _ = handle_wd.emit("now-playing", serde_json::json!({
+                                                "title": track.title,
+                                                "artist": track.artist,
+                                                "duration": track.duration,
+                                                "position": 0.0,
+                                                "artworkUrl": track.artwork_url,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                            WATCHDOG_STUCK_COUNT.store(0, Ordering::Relaxed);
+                        } else {
+                            log::debug!("WATCHDOG: position={}cs, stuck_count={}", current_pos, stuck + 1);
+                        }
+                    }));
+
+                    if let Err(e) = result {
+                        log::error!("PANIC in watchdog: {:?}", e);
                     }
                 }
             });
