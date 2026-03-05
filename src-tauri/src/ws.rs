@@ -205,20 +205,28 @@ pub async fn start_http_polling_loop(_handle: AppHandle) {
         let telem = build_telemetry();
         match api::send_telemetry(&device_id, &device_token, &telem).await {
             Ok(resp) => {
-                if let Some(cmd_str) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
-                    if !cmd_str.is_empty() {
-                        // Parse the JSON command string
-                        if let Ok(cmd_obj) = serde_json::from_str::<serde_json::Value>(cmd_str) {
-                            let command = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                            if !command.is_empty() {
-                                execute_command(command, &cmd_obj);
-                                let _ = ack_command_http(&device_id, &device_token, &resp).await;
-                            }
+                if let Some(pending) = resp.get("pendingCommand") {
+                    // API may return pendingCommand as object {command, value} or as JSON string
+                    let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
+                        // Already a JSON object: { "command": "pause", "value": null }
+                        let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        (cmd.to_string(), pending.clone())
+                    } else if let Some(cmd_str) = pending.as_str() {
+                        // JSON string that needs parsing
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cmd_str) {
+                            let cmd = parsed.get("command").and_then(|c| c.as_str()).unwrap_or(cmd_str);
+                            (cmd.to_string(), parsed)
                         } else {
-                            // Fallback: treat as plain command string
-                            execute_command(cmd_str, &resp);
-                            let _ = ack_command_http(&device_id, &device_token, &resp).await;
+                            (cmd_str.to_string(), resp.clone())
                         }
+                    } else {
+                        (String::new(), resp.clone())
+                    };
+
+                    if !command.is_empty() {
+                        log::info!("Executing pending command: {}", command);
+                        execute_command(&command, &cmd_data);
+                        let _ = ack_command_http(&device_id, &device_token, &resp).await;
                     }
                 }
             }
