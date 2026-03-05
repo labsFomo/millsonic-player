@@ -31,13 +31,26 @@ pub fn get_telemetry() -> serde_json::Value {
 fn get_disk_free() -> f64 {
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
-    disks.iter().map(|d| d.available_space() as f64 / 1_073_741_824.0).sum()
+    // Use root "/" (Mac/Linux) or "C:\" (Windows) to avoid APFS multi-volume double-counting
+    disks.iter()
+        .find(|d| {
+            let mp = d.mount_point().to_string_lossy();
+            mp == "/" || mp == "C:\\"
+        })
+        .map(|d| d.available_space() as f64 / 1_073_741_824.0)
+        .unwrap_or_else(|| disks.iter().map(|d| d.available_space() as f64 / 1_073_741_824.0).fold(0.0_f64, f64::max))
 }
 
 fn get_disk_total() -> f64 {
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
-    disks.iter().map(|d| d.total_space() as f64 / 1_073_741_824.0).sum()
+    disks.iter()
+        .find(|d| {
+            let mp = d.mount_point().to_string_lossy();
+            mp == "/" || mp == "C:\\"
+        })
+        .map(|d| d.total_space() as f64 / 1_073_741_824.0)
+        .unwrap_or_else(|| disks.iter().map(|d| d.total_space() as f64 / 1_073_741_824.0).fold(0.0_f64, f64::max))
 }
 
 pub async fn start_telemetry_loop(_handle: AppHandle) {
