@@ -62,10 +62,8 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
             continue;
         }
 
-        // Skip HTTP telemetry when WS is connected (WS sends its own)
-        if crate::ws::is_ws_connected() {
-            continue;
-        }
+        // WS is disabled, HTTP polling handles commands in ws.rs
+        // This loop is supplementary telemetry only
 
         let device_id = cfg.device_id.clone().unwrap();
         let device_token = cfg.device_token.clone().unwrap();
@@ -73,15 +71,23 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
 
         match api::send_telemetry(&device_id, &device_token, &telemetry).await {
             Ok(resp) => {
-                // Handle pending commands
-                if let Some(cmd_raw) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
-                    // pendingCommand is JSON string: {"command":"pause","value":null}
-                    if let Ok(cmd_obj) = serde_json::from_str::<serde_json::Value>(cmd_raw) {
+                // Handle pending commands (API returns object or string)
+                if let Some(pending) = resp.get("pendingCommand") {
+                    let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
                         let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                        handle_command(cmd, &cmd_obj);
+                        (cmd.to_string(), pending.clone())
+                    } else if let Some(cmd_str) = pending.as_str() {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cmd_str) {
+                            let cmd = parsed.get("command").and_then(|c| c.as_str()).unwrap_or(cmd_str);
+                            (cmd.to_string(), parsed)
+                        } else {
+                            (cmd_str.to_string(), resp.clone())
+                        }
                     } else {
-                        // Fallback: treat as plain command string
-                        handle_command(cmd_raw, &resp);
+                        (String::new(), resp.clone())
+                    };
+                    if !command.is_empty() {
+                        handle_command(&command, &cmd_data);
                     }
                 }
             }
