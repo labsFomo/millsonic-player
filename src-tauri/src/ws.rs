@@ -205,12 +205,20 @@ pub async fn start_http_polling_loop(_handle: AppHandle) {
         let telem = build_telemetry();
         match api::send_telemetry(&device_id, &device_token, &telem).await {
             Ok(resp) => {
-                if let Some(cmd) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
-                    if !cmd.is_empty() {
-                        let cmd_data = resp.clone();
-                        execute_command(cmd, &cmd_data);
-                        // ACK via HTTP
-                        let _ = ack_command_http(&device_id, &device_token, &resp).await;
+                if let Some(cmd_str) = resp.get("pendingCommand").and_then(|c| c.as_str()) {
+                    if !cmd_str.is_empty() {
+                        // Parse the JSON command string
+                        if let Ok(cmd_obj) = serde_json::from_str::<serde_json::Value>(cmd_str) {
+                            let command = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                            if !command.is_empty() {
+                                execute_command(command, &cmd_obj);
+                                let _ = ack_command_http(&device_id, &device_token, &resp).await;
+                            }
+                        } else {
+                            // Fallback: treat as plain command string
+                            execute_command(cmd_str, &resp);
+                            let _ = ack_command_http(&device_id, &device_token, &resp).await;
+                        }
                     }
                 }
             }
