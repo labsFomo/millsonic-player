@@ -7,6 +7,7 @@ mod config;
 mod telemetry;
 mod api;
 mod ws;
+mod updater;
 
 use tauri::{Manager, Emitter};
 use std::time::Duration;
@@ -222,6 +223,7 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_status,
             pair_device,
@@ -231,6 +233,7 @@ fn main() {
             get_now_playing,
             get_logs,
             install_launch_agent,
+            updater::install_update,
         ])
         .setup(|app| {
             // Load config and set initial volume
@@ -238,6 +241,10 @@ fn main() {
             log::info!("About to init audio...");
             let _ = audio::set_volume(cfg.volume);
             log::info!("Audio initialized OK");
+
+            // Start update checker loop
+            let handle_update = app.handle().clone();
+            tauri::async_runtime::spawn(updater::start_update_loop(handle_update));
 
             // Start sync loop
             log::info!("Setting up sync loop...");

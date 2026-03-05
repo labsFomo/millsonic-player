@@ -30,6 +30,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": [
       "msi",
       "nsis",
@@ -45,5 +46,13 @@
       "icons/icon.icns",
       "icons/icon.png"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFDOUQ2NjQ5MzhDRDQ3NTUKUldSVlI4MDRTV2FkckI5N3JvbjAyNWZXb0s4ZlpUTkZ5dnVaVjIxb1lmMlNyWEtPUlFxT3YrUkUK",
+      "endpoints": [
+        "https://apimillsonic.fo.com.uy/api/v1/devices/update/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    }
   }
 }

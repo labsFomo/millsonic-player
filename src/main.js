@@ -210,6 +210,26 @@ async function setupListeners() {
     }
   });
 
+  await listen('update-available', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    showUpdateModal(data.version, data.notes);
+  });
+
+  await listen('update-progress', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    const el = document.getElementById('update-status');
+    if (!el) return;
+    if (data.phase === 'downloading' && data.percent !== undefined) {
+      el.textContent = `Descargando... ${data.percent}%`;
+    } else if (data.phase === 'installing') {
+      el.textContent = 'Instalando...';
+    } else if (data.phase === 'restarting') {
+      el.textContent = 'Reiniciando...';
+    }
+  });
+
   await listen('status-change', (event) => {
     const data = event.payload;
     if (data && data.playing !== undefined) {
@@ -217,6 +237,52 @@ async function setupListeners() {
       document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
     }
   });
+}
+
+// --- Update Modal ---
+let updateDismissed = false;
+function showUpdateModal(version, notes) {
+  if (updateDismissed) return;
+  let modal = document.getElementById('update-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'update-modal';
+  modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;align-items:center;justify-content:center;';
+  modal.innerHTML = `
+    <div style="background:#111827;border-radius:16px;padding:24px;width:300px;text-align:center;">
+      <p style="font-size:24px;margin-bottom:8px;">🎉</p>
+      <p style="font-size:15px;font-weight:600;margin-bottom:4px;">Nueva versión ${version} disponible</p>
+      <p style="font-size:12px;color:#94A3B8;margin-bottom:16px;">${notes || ''}</p>
+      <p id="update-status" style="color:#60A5FA;font-size:12px;min-height:18px;margin-bottom:12px;"></p>
+      <div style="display:flex;gap:8px;">
+        <button id="update-later-btn" onclick="dismissUpdate()" style="flex:1;padding:10px;background:#1E293B;border:none;border-radius:10px;color:#94A3B8;cursor:pointer;font-size:13px;">Después</button>
+        <button id="update-now-btn" onclick="doUpdate()" style="flex:1;padding:10px;background:#3B82F6;border:none;border-radius:10px;color:white;cursor:pointer;font-size:13px;font-weight:600;">Actualizar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+function dismissUpdate() {
+  updateDismissed = true;
+  document.getElementById('update-modal')?.remove();
+}
+
+async function doUpdate() {
+  const invoke = getInvoke();
+  if (!invoke) return;
+  const btn = document.getElementById('update-now-btn');
+  const laterBtn = document.getElementById('update-later-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Actualizando...'; btn.style.opacity = '0.6'; }
+  if (laterBtn) { laterBtn.disabled = true; laterBtn.style.opacity = '0.4'; }
+  const statusEl = document.getElementById('update-status');
+  if (statusEl) statusEl.textContent = 'Descargando...';
+  try {
+    await invoke('install_update');
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'Error: ' + e;
+    if (btn) { btn.disabled = false; btn.textContent = 'Reintentar'; btn.style.opacity = '1'; }
+    if (laterBtn) { laterBtn.disabled = false; laterBtn.style.opacity = '1'; }
+  }
 }
 
 // --- Init ---
