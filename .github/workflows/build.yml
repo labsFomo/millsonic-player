@@ -49,6 +49,10 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@2
 
+      - name: Install create-dmg (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install create-dmg
+
       - name: Build Tauri app
         run: npx tauri build ${{ matrix.os == 'macos-latest' && '--target universal-apple-darwin' || '' }}
         env:
