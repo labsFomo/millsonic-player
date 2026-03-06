@@ -741,31 +741,48 @@ pub fn check_track_advancement(handle: &AppHandle) {
         return;
     }
 
-    // Record play report for finished track
-    if let Some(track) = player.current_track() {
-        if position > 3.0 {
-            let zone_id = cfg.zone_id.as_deref().unwrap_or("");
-            let started_at = Utc::now().to_rfc3339();
-            db::save_play_report(&track.track_id, zone_id, &started_at, position as f64);
-            db::touch_track(&track.track_id);
-        }
+    // Collect data for DB calls, then drop audio lock to avoid deadlock
+    let report_data = player.current_track().map(|track| {
+        let track_id = track.track_id.clone();
+        let file_path = track.file_path.clone();
+        let track_title = track.title.clone();
+        let track_dur = track.duration;
+        (track_id, file_path, track_title, track_dur)
+    });
 
-        if position < 3.0 && track.duration > 5.0 {
+    if let Some((ref track_id, ref file_path, ref track_title, track_dur)) = report_data {
+        if position < 3.0 && track_dur > 5.0 {
             log::error!("Track '{}' finished after only {:.1}s (expected {:.0}s) - file may be corrupt: {}",
-                track.title, position, track.duration, track.file_path);
-            if let Ok(meta) = std::fs::metadata(&track.file_path) {
-                log::error!("File size: {} bytes", meta.len());
-            } else {
-                log::error!("File does NOT exist: {}", track.file_path);
-            }
+                track_title, position, track_dur, file_path);
             player.consecutive_skips += 1;
         } else {
             player.consecutive_skips = 0;
         }
     }
 
-    if player.consecutive_skips >= player.playlist_len() && player.playlist_len() > 0 {
-        log::error!("All {} tracks failed to play. Stopping.", player.playlist_len());
+    // Drop audio lock BEFORE DB operations to prevent deadlock
+    let consecutive_skips = player.consecutive_skips;
+    let playlist_len = player.playlist_len();
+    drop(player);
+
+    // Now safe to call DB without holding audio lock
+    if let Some((track_id, _, _, _)) = &report_data {
+        if position > 3.0 {
+            let zone_id = cfg.zone_id.as_deref().unwrap_or("");
+            let started_at = Utc::now().to_rfc3339();
+            db::save_play_report(track_id, zone_id, &started_at, position as f64);
+            db::touch_track(track_id);
+        }
+    }
+
+    // Re-acquire audio lock for the rest of advancement
+    let mut player = match audio::player().lock() {
+        Ok(p) => p,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if consecutive_skips >= playlist_len && playlist_len > 0 {
+        log::error!("All {} tracks failed to play. Stopping.", playlist_len);
         player.stop();
         let _ = handle.emit("now-playing", serde_json::json!({
             "title": "Error de reproducción",
