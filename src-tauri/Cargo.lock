@@ -2168,6 +2168,7 @@ dependencies = [
  "chrono-tz",
  "dirs 5.0.1",
  "futures-util",
+ "libc",
  "log",
  "rand 0.8.5",
  "reqwest 0.12.28",

@@ -29,32 +29,37 @@ pub fn get_telemetry() -> serde_json::Value {
     })
 }
 
-fn get_disk_free() -> f64 {
+fn get_disk_info() -> (f64, f64) {
+    // Use statvfs for accurate disk info on macOS/Linux (avoids APFS multi-volume issues)
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let path = CString::new("/").unwrap();
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(path.as_ptr(), &mut stat) == 0 {
+                let total = (stat.f_blocks as f64 * stat.f_frsize as f64) / 1_073_741_824.0;
+                let free = (stat.f_bavail as f64 * stat.f_frsize as f64) / 1_073_741_824.0;
+                return (free, total);
+            }
+        }
+    }
+    // Fallback to sysinfo
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
-    // Use root "/" (Mac/Linux) or "C:\" (Windows) to avoid APFS multi-volume double-counting
-    disks.iter()
-        .find(|d| {
-            let mp = d.mount_point().to_string_lossy();
-            mp == "/" || mp == "C:\\"
-        })
-        .map(|d| d.available_space() as f64 / 1_073_741_824.0)
-        .unwrap_or_else(|| disks.iter().map(|d| d.available_space() as f64 / 1_073_741_824.0).fold(0.0_f64, f64::max))
+    let disk = disks.iter().find(|d| {
+        let mp = d.mount_point().to_string_lossy();
+        mp == "/" || mp == "C:\\"
+    });
+    let free = disk.map(|d| d.available_space() as f64 / 1_073_741_824.0).unwrap_or(0.0);
+    let total = disk.map(|d| d.total_space() as f64 / 1_073_741_824.0).unwrap_or(0.0);
+    (free, total)
 }
 
-fn get_disk_total() -> f64 {
-    use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
-    disks.iter()
-        .find(|d| {
-            let mp = d.mount_point().to_string_lossy();
-            mp == "/" || mp == "C:\\"
-        })
-        .map(|d| d.total_space() as f64 / 1_073_741_824.0)
-        .unwrap_or_else(|| disks.iter().map(|d| d.total_space() as f64 / 1_073_741_824.0).fold(0.0_f64, f64::max))
-}
+fn get_disk_free() -> f64 { get_disk_info().0 }
+fn get_disk_total() -> f64 { get_disk_info().1 }
 
-pub async fn start_telemetry_loop(_handle: AppHandle) {
+pub async fn start_telemetry_loop(handle: AppHandle) {
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -87,6 +92,7 @@ pub async fn start_telemetry_loop(_handle: AppHandle) {
         match result {
             Ok(Ok(resp)) => {
                 consecutive_failures = 0;
+                crate::sync::set_connection_status(crate::sync::ConnectionStatus::Online, &handle);
                 if let Some(pending) = resp.get("pendingCommand") {
                     let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
                         let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");

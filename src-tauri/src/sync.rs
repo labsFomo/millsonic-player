@@ -24,7 +24,7 @@ pub fn get_connection_status() -> ConnectionStatus {
     *conn_status().lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn set_connection_status(status: ConnectionStatus, handle: &AppHandle) {
+pub fn set_connection_status(status: ConnectionStatus, handle: &AppHandle) {
     let mut s = conn_status().lock().unwrap_or_else(|e| e.into_inner());
     if *s != status {
         log::info!("Connection status: {:?} → {:?}", *s, status);
