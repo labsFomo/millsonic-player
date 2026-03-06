@@ -35,7 +35,8 @@ fn set_ws_connected(connected: bool, handle: &AppHandle) {
 
 fn execute_command(cmd: &str, data: &serde_json::Value) {
     log::info!("WS command: {} data={}", cmd, data);
-    match cmd {
+    let cmd_lower = cmd.to_lowercase();
+    match cmd_lower.as_str() {
         "play" => {
             if let Ok(mut p) = audio::player().try_lock() {
                 p.resume();
@@ -50,7 +51,7 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
                 log::warn!("Could not lock audio player for pause command (busy)");
             }
         }
-        "setVolume" => {
+        "setvolume" => {
             if let Some(vol) = data.get("value").and_then(|v| v.as_u64()) {
                 if let Ok(mut p) = audio::player().try_lock() {
                     p.set_volume(vol as u8);
@@ -62,10 +63,10 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
                 });
             }
         }
-        "forceSync" => {
+        "forcesync" => {
             sync::trigger_sync();
         }
-        "skipTrack" => {
+        "skiptrack" => {
             if let Ok(mut p) = audio::player().try_lock() {
                 let _ = p.skip_track();
             } else {

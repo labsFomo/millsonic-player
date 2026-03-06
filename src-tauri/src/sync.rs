@@ -708,7 +708,8 @@ pub fn check_track_advancement(handle: &AppHandle) {
         // Log position every 30s for debugging
         let pos = player.get_position();
         if pos > 0.0 && (pos as u32) % 30 == 0 {
-            log::info!("Still playing at {:.0}s", pos);
+            let dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
+            log::info!("Still playing at {:.0}s / {:.0}s (finished={})", pos, dur, player.is_finished());
         }
         return;
     }

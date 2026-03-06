@@ -128,18 +128,19 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
         }
     };
 
-    match cmd {
+    let cmd_lower = cmd.to_lowercase();
+    match cmd_lower.as_str() {
         "play" => player.resume(),
         "pause" => player.pause(),
-        "setVolume" => {
+        "setvolume" | "setVolume" => {
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
                 player.set_volume(val as u8);
             }
         }
-        "skipTrack" => {
+        "skiptrack" => {
             let _ = player.skip_track();
         }
-        "forceSync" => {
+        "forcesync" => {
             crate::sync::trigger_sync();
         }
         _ => log::warn!("Unknown command: {}", cmd),
