@@ -142,11 +142,20 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
 
     let cmd_lower = cmd.to_lowercase();
     match cmd_lower.as_str() {
-        "play" => player.resume(),
-        "pause" => player.pause(),
+        "play" => {
+            log::info!("Resuming playback");
+            player.resume();
+        }
+        "pause" => {
+            log::info!("Pausing playback");
+            player.pause();
+        }
         "setvolume" | "volume" => {
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
+                log::info!("Setting volume to {}%", val);
                 player.set_volume(val as u8);
+            } else {
+                log::warn!("VOLUME command missing value: {:?}", resp);
             }
         }
         "skiptrack" | "next" | "skip" => {
