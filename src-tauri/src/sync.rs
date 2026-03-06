@@ -705,11 +705,12 @@ pub fn check_track_advancement(handle: &AppHandle) {
         if player.get_position() > 5.0 {
             player.consecutive_skips = 0;
         }
-        // Log position every 30s for debugging
+        // Log position every 30s, and every second in the last 10s of track
         let pos = player.get_position();
-        if pos > 0.0 && (pos as u32) % 30 == 0 {
-            let dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
-            log::info!("Still playing at {:.0}s / {:.0}s (finished={})", pos, dur, player.is_finished());
+        let dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
+        let near_end = dur > 1.0 && pos >= dur - 10.0;
+        if pos > 0.0 && ((pos as u32) % 30 == 0 || near_end) {
+            log::info!("Playing {:.0}s / {:.0}s (finished={})", pos, dur, player.is_finished());
         }
         return;
     }
