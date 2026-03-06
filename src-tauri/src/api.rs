@@ -69,6 +69,15 @@ pub async fn send_telemetry(device_id: &str, device_token: &str, telemetry: &ser
     Ok(resp)
 }
 
+pub async fn ack_command(device_id: &str, device_token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = client()
+        .post(format!("{}/devices/{}/command-ack", API_BASE, device_id))
+        .json(&serde_json::json!({ "deviceToken": device_token }))
+        .send()
+        .await?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct PlayReportBatch {
     #[serde(rename = "deviceToken")]

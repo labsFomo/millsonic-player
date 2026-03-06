@@ -109,6 +109,12 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
                     };
                     if !command.is_empty() {
                         handle_command(&command, &cmd_data);
+                        // ACK command so API clears pendingCommand
+                        let did = device_id.clone();
+                        let dtk = device_token.clone();
+                        tokio::spawn(async move {
+                            let _ = api::ack_command(&did, &dtk).await;
+                        });
                     }
                 }
             }
