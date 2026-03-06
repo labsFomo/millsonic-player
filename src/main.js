@@ -183,6 +183,13 @@ async function setupListeners() {
     }
   });
 
+  await listen('playback-state', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    isPlaying = data.state === 'playing';
+    document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
+  });
+
   await listen('connection-status', (event) => {
     const data = event.payload;
     if (!data) return;

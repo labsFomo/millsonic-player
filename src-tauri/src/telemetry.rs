@@ -1,7 +1,7 @@
 use crate::{api, audio, config};
 use sysinfo::System;
 use std::time::Duration;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 pub fn get_telemetry() -> serde_json::Value {
     let mut sys = System::new_all();
@@ -108,7 +108,7 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
                         (String::new(), resp.clone())
                     };
                     if !command.is_empty() {
-                        handle_command(&command, &cmd_data);
+                        handle_command(&command, &cmd_data, &handle);
                         // ACK command so API clears pendingCommand
                         let did = device_id.clone();
                         let dtk = device_token.clone();
@@ -130,7 +130,7 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
     }
 }
 
-fn handle_command(cmd: &str, resp: &serde_json::Value) {
+fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle) {
     log::info!("Executing remote command: {}", cmd);
     let mut player = match audio::player().try_lock() {
         Ok(p) => p,
@@ -145,10 +145,12 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
         "play" => {
             log::info!("Resuming playback");
             player.resume();
+            let _ = handle.emit("playback-state", serde_json::json!({ "state": "playing" }));
         }
         "pause" => {
             log::info!("Pausing playback");
             player.pause();
+            let _ = handle.emit("playback-state", serde_json::json!({ "state": "paused" }));
         }
         "setvolume" | "volume" => {
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
