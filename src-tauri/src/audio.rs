@@ -211,11 +211,12 @@ impl AudioPlayer {
     pub fn play_spot_file(&mut self, file_path: &str) -> Result<(), String> {
         log::info!("Playing spot: {}", file_path);
         self.playing_spot = true;
+        // Reset position timer so is_finished() doesn't immediately trigger
+        self.play_started_at = Some(Instant::now());
+        self.pause_elapsed = 0.0;
 
         if !self.audio_available {
             self.is_playing = true;
-            self.play_started_at = Some(Instant::now());
-            self.pause_elapsed = 0.0;
             return Ok(());
         }
 
@@ -305,9 +306,12 @@ impl AudioPlayer {
     pub fn is_finished(&self) -> bool {
         // Position-based fallback: if position >= duration - 0.5s, consider finished
         // This handles cases where rodio sink.empty() doesn't return true reliably
-        if let Some(track) = self.current_track() {
-            if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
-                return true;
+        // Skip for spots (spot duration unknown, rely on sink.empty() only)
+        if !self.playing_spot {
+            if let Some(track) = self.current_track() {
+                if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
+                    return true;
+                }
             }
         }
 

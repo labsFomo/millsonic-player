@@ -716,6 +716,10 @@ pub fn check_track_advancement(handle: &AppHandle) {
     }
 
     let position = player.get_position();
+    let track_title = player.current_track().map(|t| t.title.clone()).unwrap_or_default();
+    let track_dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
+    log::info!("Track '{}' finished at {:.1}s (duration={:.1}s, playing_spot={})", 
+        track_title, position, track_dur, player.playing_spot);
 
     // If a spot just finished, resume normal playback
     if player.playing_spot {
