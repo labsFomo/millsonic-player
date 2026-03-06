@@ -724,6 +724,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
         log::info!("Spot finished, resuming normal playback");
         player.playing_spot = false;
         player.tracks_since_last_spot = 0;
+        player.advance(); // Move to NEXT track (previous track already finished before spot)
         if let Err(e) = player.play_current() {
             log::error!("Error resuming after spot: {}", e);
         }
