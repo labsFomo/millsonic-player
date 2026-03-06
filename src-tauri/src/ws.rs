@@ -63,10 +63,10 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
                 });
             }
         }
-        "forcesync" => {
+        "forcesync" | "force_sync" => {
             sync::trigger_sync();
         }
-        "skiptrack" => {
+        "skiptrack" | "next" | "skip" => {
             if let Ok(mut p) = audio::player().try_lock() {
                 let _ = p.skip_track();
             } else {

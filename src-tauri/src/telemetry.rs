@@ -137,10 +137,10 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
                 player.set_volume(val as u8);
             }
         }
-        "skiptrack" => {
+        "skiptrack" | "next" | "skip" => {
             let _ = player.skip_track();
         }
-        "forcesync" => {
+        "forcesync" | "force_sync" => {
             crate::sync::trigger_sync();
         }
         _ => log::warn!("Unknown command: {}", cmd),
