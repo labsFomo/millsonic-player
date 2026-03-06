@@ -132,7 +132,7 @@ fn handle_command(cmd: &str, resp: &serde_json::Value) {
     match cmd_lower.as_str() {
         "play" => player.resume(),
         "pause" => player.pause(),
-        "setvolume" | "setVolume" => {
+        "setvolume" | "volume" => {
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
                 player.set_volume(val as u8);
             }

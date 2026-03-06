@@ -51,7 +51,7 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
                 log::warn!("Could not lock audio player for pause command (busy)");
             }
         }
-        "setvolume" => {
+        "setvolume" | "volume" => {
             if let Some(vol) = data.get("value").and_then(|v| v.as_u64()) {
                 if let Ok(mut p) = audio::player().try_lock() {
                     p.set_volume(vol as u8);
