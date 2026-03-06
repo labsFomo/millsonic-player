@@ -595,7 +595,7 @@ async fn download_and_save_spots(spots: &[serde_json::Value]) {
 }
 
 /// Check if a spot should play based on schedule rules
-fn find_eligible_spot(tz: &chrono_tz::Tz) -> Option<String> {
+fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Option<String> {
     let now = Utc::now().with_timezone(tz);
     let day_of_week = now.weekday().num_days_from_monday();
     let current_time = now.format("%H:%M").to_string();
@@ -609,11 +609,9 @@ fn find_eligible_spot(tz: &chrono_tz::Tz) -> Option<String> {
             continue;
         }
 
-        // Check track frequency
-        if let Ok(player) = audio::player().lock() {
-            if player.tracks_since_last_spot < *track_freq as usize {
-                continue;
-            }
+        // Check track frequency (passed in to avoid re-locking audio mutex)
+        if tracks_since_last_spot < *track_freq as usize {
+            continue;
         }
 
         // Check day of week
@@ -800,7 +798,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
     // Check if a spot should play before next track
     let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
-    if let Some(spot_path) = find_eligible_spot(&tz) {
+    if let Some(spot_path) = find_eligible_spot(&tz, player.tracks_since_last_spot) {
         log::info!("Playing spot before next track (tracks since last: {})", player.tracks_since_last_spot);
         match player.play_spot_file(&spot_path) {
             Ok(_) => {
