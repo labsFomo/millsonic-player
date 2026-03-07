@@ -13,6 +13,7 @@ pub fn get_telemetry() -> serde_json::Value {
     // Use try_lock to never block audio thread
     let player = audio::player().try_lock().ok();
     let is_playing = player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
+    let volume = player.as_ref().map(|p| p.get_volume()).unwrap_or(80);
     let current_track_id = player
         .as_ref()
         .and_then(|p| p.current_track().map(|t| t.track_id.clone()));
@@ -24,6 +25,7 @@ pub fn get_telemetry() -> serde_json::Value {
         "diskFree": get_disk_free(),
         "diskTotal": get_disk_total(),
         "isPlaying": is_playing,
+        "volume": volume,
         "currentTrackId": current_track_id,
         "appVersion": env!("CARGO_PKG_VERSION"),
     })
@@ -156,6 +158,7 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
                 log::info!("Setting volume to {}%", val);
                 player.set_volume(val as u8);
+                let _ = handle.emit("volume-change", serde_json::json!({ "volume": val }));
             } else {
                 log::warn!("VOLUME command missing value: {:?}", resp);
             }

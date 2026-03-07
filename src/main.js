@@ -190,6 +190,16 @@ async function setupListeners() {
     document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
   });
 
+  await listen('volume-change', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    const vol = data.volume;
+    const slider = document.getElementById('volume-slider');
+    const label = document.getElementById('volume-label');
+    if (slider) slider.value = vol;
+    if (label) label.textContent = vol + '%';
+  });
+
   await listen('connection-status', (event) => {
     const data = event.payload;
     if (!data) return;
