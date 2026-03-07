@@ -1,6 +1,6 @@
 {
   "productName": "Millsonic Player",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "identifier": "com.millsonic.player",
   "build": {
     "frontendDist": "../src",
