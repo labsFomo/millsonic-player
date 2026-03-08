@@ -106,7 +106,7 @@ pub async fn start_ws_loop(handle: AppHandle) {
 
         let token = cfg.device_token.clone().unwrap();
         let _device_id = cfg.device_id.clone().unwrap();
-        let url = format!("wss://apimillsonic.fo.com.uy/devices/ws?deviceToken={}", token);
+        let url = format!("wss://apifo.millsonic.com/devices/ws?deviceToken={}", token);
 
         log::info!("WebSocket connecting to {}", url);
 
@@ -277,7 +277,7 @@ async fn ack_command_http(device_id: &str, device_token: &str, resp: &serde_json
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    client.post(format!("https://apimillsonic.fo.com.uy/api/v1/devices/{}/command-ack", device_id))
+    client.post(format!("https://apifo.millsonic.com/api/v1/devices/{}/command-ack", device_id))
         .json(&serde_json::json!({
             "deviceToken": device_token,
             "commandId": cmd_id,

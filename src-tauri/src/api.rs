@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::path::Path;
 
-const API_BASE: &str = "https://apimillsonic.fo.com.uy/api/v1";
+const API_BASE: &str = "https://apifo.millsonic.com/api/v1";
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
