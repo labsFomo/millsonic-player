@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub unpair_pin: Option<String>,
     pub crossfade_enabled: bool,
     pub crossfade_duration: u32,
+    pub location_name: Option<String>,
+    pub debug_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -33,6 +35,8 @@ impl Default for AppConfig {
             unpair_pin: None,
             crossfade_enabled: false,
             crossfade_duration: 3,
+            location_name: None,
+            debug_mode: false,
         }
     }
 }

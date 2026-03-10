@@ -77,6 +77,14 @@ fn execute_command(cmd: &str, data: &serde_json::Value) {
             log::info!("Restart command received, exiting...");
             std::process::exit(0);
         }
+        "set_debug" | "setdebug" | "debug" => {
+            let enabled = data.get("value")
+                .or_else(|| data.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            log::info!("Debug mode set to: {} (via command)", enabled);
+            let _ = config::AppConfig::update_and_save(|cfg| { cfg.debug_mode = enabled; });
+        }
         _ => {
             log::warn!("Unknown WS command: {}", cmd);
         }

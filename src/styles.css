@@ -69,6 +69,38 @@ h2 { font-size: 18px; margin-bottom: 4px; }
 .spacer { flex: 1; }
 .version { color: #475569; }
 
+.status-center { color: #94A3B8; font-size: 11px; white-space: nowrap; }
+.debug-indicator { font-size: 11px; margin-right: 2px; }
+
+/* Debug overlay */
+.debug-overlay {
+  position: absolute; left: 0; right: 0; bottom: 52px;
+  height: 140px; background: rgba(0,0,0,0.9); overflow-y: auto;
+  font-family: monospace; font-size: 10px; color: #0f0; padding: 6px 8px;
+  border-top: 1px solid #1E293B; white-space: pre-wrap; word-break: break-all;
+  z-index: 50;
+}
+
+/* Stats panel */
+.stats-panel {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(10,22,40,0.95); z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+}
+.stats-panel-inner {
+  background: #111827; border-radius: 16px; padding: 20px; width: 320px;
+}
+.stats-header {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 14px; font-weight: 600; margin-bottom: 16px; color: #F1F5F9;
+}
+.stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.stat-item {
+  background: #0A1628; border-radius: 10px; padding: 12px; text-align: center;
+}
+.stat-value { display: block; font-size: 20px; font-weight: 700; color: #00D4AA; }
+.stat-label { display: block; font-size: 10px; color: #64748B; margin-top: 4px; }
+
 .unpair-btn {
   position: absolute; top: 8px; right: 8px; background: none; border: none;
   color: #475569; font-size: 14px; cursor: pointer; padding: 4px 6px; border-radius: 6px;

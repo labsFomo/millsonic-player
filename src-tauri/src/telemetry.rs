@@ -28,6 +28,7 @@ pub fn get_telemetry() -> serde_json::Value {
         "volume": volume,
         "currentTrackId": current_track_id,
         "appVersion": env!("CARGO_PKG_VERSION"),
+        "debugMode": config::AppConfig::load().debug_mode,
     })
 }
 
@@ -168,6 +169,18 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
         }
         "forcesync" | "force_sync" => {
             crate::sync::trigger_sync();
+        }
+        "set_debug" | "setdebug" | "debug" => {
+            let enabled = resp.get("value")
+                .or_else(|| resp.get("commandValue"))
+                .or_else(|| resp.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            log::info!("Debug mode set to: {} (via telemetry command)", enabled);
+            drop(player);
+            let _ = config::AppConfig::update_and_save(|cfg| { cfg.debug_mode = enabled; });
+            let _ = handle.emit("debug-mode", serde_json::json!({ "enabled": enabled }));
+            return;
         }
         _ => log::warn!("Unknown command: {}", cmd),
     }

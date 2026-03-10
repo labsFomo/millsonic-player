@@ -37,7 +37,9 @@ fn get_status() -> serde_json::Value {
         "track": track,
         "artist": artist,
         "zoneName": cfg.zone_name,
+        "locationName": cfg.location_name,
         "connectionStatus": conn_status,
+        "debugMode": cfg.debug_mode,
     })
 }
 
@@ -161,6 +163,61 @@ fn get_logs() -> String {
     }
 }
 
+#[tauri::command]
+fn get_stats() -> serde_json::Value {
+    let cache_dir = config::AppConfig::cache_dir();
+    let spots_dir = config::AppConfig::data_dir().join("cache").join("spots");
+
+    let tracks_downloaded = std::fs::read_dir(&cache_dir)
+        .map(|e| e.filter_map(|f| f.ok()).filter(|f| f.path().extension().map(|x| x == "mp3").unwrap_or(false)).count())
+        .unwrap_or(0);
+
+    let spots_downloaded = std::fs::read_dir(&spots_dir)
+        .map(|e| e.filter_map(|f| f.ok()).filter(|f| f.path().extension().map(|x| x == "mp3").unwrap_or(false)).count())
+        .unwrap_or(0);
+
+    // Total cache size on disk
+    let mut total_bytes: u64 = 0;
+    for dir in &[&cache_dir, &spots_dir] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if let Ok(meta) = entry.metadata() {
+                    total_bytes += meta.len();
+                }
+            }
+        }
+    }
+
+    // Estimate hours of music (avg 3.5 min per track)
+    let hours_offline = (tracks_downloaded as f64 * 3.5) / 60.0;
+
+    // Tracks pending: we don't have total playlist count easily, return 0 for now
+    // The frontend can compute this from sync data if needed
+    let tracks_pending = 0;
+
+    serde_json::json!({
+        "tracksDownloaded": tracks_downloaded,
+        "tracksPending": tracks_pending,
+        "spotsDownloaded": spots_downloaded,
+        "cacheSizeBytes": total_bytes,
+        "cacheSizeMB": (total_bytes as f64 / 1_048_576.0 * 10.0).round() / 10.0,
+        "hoursOffline": (hours_offline * 10.0).round() / 10.0,
+    })
+}
+
+#[tauri::command]
+fn get_debug_mode() -> bool {
+    config::AppConfig::load().debug_mode
+}
+
+#[tauri::command]
+fn set_debug_mode(enabled: bool) -> Result<(), String> {
+    log::info!("Debug mode set to: {}", enabled);
+    config::AppConfig::update_and_save(|cfg| {
+        cfg.debug_mode = enabled;
+    })
+}
+
 /// Global atomics for watchdog: track audio position (centiseconds)
 static WATCHDOG_LAST_POSITION: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_STUCK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -232,6 +289,9 @@ fn main() {
             toggle_playback,
             get_now_playing,
             get_logs,
+            get_stats,
+            get_debug_mode,
+            set_debug_mode,
             install_launch_agent,
             updater::install_update,
         ])

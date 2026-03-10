@@ -300,6 +300,30 @@ async fn do_sync(
         }
     }
 
+    // Extract zone name and location name from sync response
+    let zone_name = sync_data.get("zone")
+        .and_then(|z| z.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let location_name = sync_data.get("zone")
+        .and_then(|z| z.get("location"))
+        .and_then(|l| l.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| sync_data.get("locationName").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    if zone_name.is_some() || location_name.is_some() {
+        config::update_and_save_global(|c| {
+            if let Some(ref zn) = zone_name { c.zone_name = Some(zn.clone()); }
+            if let Some(ref ln) = location_name { c.location_name = Some(ln.clone()); }
+        });
+        // Emit event so frontend updates immediately
+        let _ = handle.emit("zone-info", serde_json::json!({
+            "zoneName": zone_name,
+            "locationName": location_name,
+        }));
+    }
+
     // Get timezone from sync response
     let tz_str = sync_data.get("timezone").and_then(|v| v.as_str()).unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);

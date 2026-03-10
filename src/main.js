@@ -27,7 +27,7 @@ async function pairDevice() {
       document.getElementById('pairing-screen').classList.add('hidden');
       document.getElementById('loading-overlay').classList.remove('hidden');
       if (result.zone && result.zone.name) {
-        document.getElementById('zone-name').textContent = result.zone.name;
+        updateZoneDisplay(result.zone.location?.name, result.zone.name);
       }
       errorEl.textContent = '';
     } else {
@@ -254,6 +254,33 @@ async function setupListeners() {
       document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
     }
   });
+
+  await listen('zone-info', (event) => {
+    const data = event.payload;
+    if (!data) return;
+    updateZoneDisplay(data.locationName, data.zoneName);
+  });
+
+  await listen('debug-mode', (event) => {
+    const data = event.payload;
+    if (data) setDebugMode(!!data.enabled);
+  });
+}
+
+// --- Zone Display ---
+function updateZoneDisplay(locationName, zoneName) {
+  const locEl = document.getElementById('location-name');
+  const zoneEl = document.getElementById('zone-name');
+  const sepEl = document.getElementById('zone-separator');
+  if (locationName) locEl.textContent = locationName;
+  if (zoneName) zoneEl.textContent = zoneName;
+  const hasLoc = locEl.textContent && locEl.textContent !== '—';
+  const hasZone = zoneEl.textContent && zoneEl.textContent !== '—';
+  if (hasLoc && hasZone) {
+    sepEl.classList.remove('hidden');
+  } else {
+    sepEl.classList.add('hidden');
+  }
 }
 
 // --- Update Modal ---
@@ -322,8 +349,11 @@ async function init() {
         document.getElementById('player-screen').classList.add('hidden');
       }
 
-      if (status.zoneName) {
-        document.getElementById('zone-name').textContent = status.zoneName;
+      if (status.zoneName || status.locationName) {
+        updateZoneDisplay(status.locationName, status.zoneName);
+      }
+      if (status.debugMode) {
+        setDebugMode(true);
       }
       if (status.volume) {
         document.getElementById('volume').value = status.volume;
@@ -363,6 +393,71 @@ async function init() {
   } catch (e) {
     console.error('Init error:', e);
   }
+}
+
+// --- Stats Panel ---
+async function toggleStatsPanel() {
+  const panel = document.getElementById('stats-panel');
+  if (panel.classList.contains('hidden')) {
+    panel.classList.remove('hidden');
+    await refreshStats();
+  } else {
+    panel.classList.add('hidden');
+  }
+}
+
+function closeStatsPanel() {
+  document.getElementById('stats-panel').classList.add('hidden');
+}
+
+async function refreshStats() {
+  const invoke = getInvoke();
+  if (!invoke) return;
+  try {
+    const stats = await invoke('get_stats');
+    document.getElementById('stat-tracks').textContent = stats.tracksDownloaded;
+    document.getElementById('stat-pending').textContent = stats.tracksPending;
+    document.getElementById('stat-spots').textContent = stats.spotsDownloaded;
+    document.getElementById('stat-cache').textContent = stats.cacheSizeMB + ' MB';
+    document.getElementById('stat-hours').textContent = stats.hoursOffline + 'h';
+  } catch (e) {
+    console.error('Stats error:', e);
+  }
+}
+
+// --- Debug Mode ---
+let debugMode = false;
+let debugLogInterval = null;
+
+function setDebugMode(enabled) {
+  debugMode = enabled;
+  const indicator = document.getElementById('debug-indicator');
+  const overlay = document.getElementById('debug-overlay');
+  if (enabled) {
+    indicator.classList.remove('hidden');
+    overlay.classList.remove('hidden');
+    if (!debugLogInterval) {
+      refreshDebugLogs();
+      debugLogInterval = setInterval(refreshDebugLogs, 3000);
+    }
+  } else {
+    indicator.classList.add('hidden');
+    overlay.classList.add('hidden');
+    if (debugLogInterval) { clearInterval(debugLogInterval); debugLogInterval = null; }
+  }
+}
+
+async function refreshDebugLogs() {
+  const invoke = getInvoke();
+  if (!invoke) return;
+  try {
+    const logs = await invoke('get_logs');
+    const lines = logs.split('\n');
+    const last50 = lines.slice(-50).join('\n');
+    const el = document.getElementById('debug-overlay');
+    el.textContent = last50;
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {}
 }
 
 // --- Log Viewer ---
