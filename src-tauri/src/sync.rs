@@ -361,6 +361,14 @@ async fn do_sync(
     } else {
         // Clear spots if none in sync
         db::save_spot_schedules(&[]);
+        // Also clean spot cache files
+        let spots_cache = config::AppConfig::data_dir().join("cache").join("spots");
+        if let Ok(entries) = std::fs::read_dir(&spots_cache) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        log::info!("Cleared spot cache (no spots in sync)");
     }
 
     // Parse schedule and save to SQLite
