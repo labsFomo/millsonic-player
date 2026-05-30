@@ -33,6 +33,12 @@ pub struct AudioPlayer {
     // Spot playback
     pub playing_spot: bool,
     pub tracks_since_last_spot: usize,
+    // SonicBox: forced next track (a winning vote) + its bookkeeping
+    forced_next: Option<TrackInfo>,
+    forced_vote_id: Option<String>,
+    pub playing_sonicbox: bool,
+    sonicbox_current: Option<TrackInfo>,
+    sonicbox_vote_id: Option<String>,
 }
 
 // Safety: OutputStream is !Send but we only access from one thread via Mutex
@@ -77,6 +83,59 @@ impl AudioPlayer {
             crossfade_duration_secs: 3.0,
             playing_spot: false,
             tracks_since_last_spot: 0,
+            forced_next: None,
+            forced_vote_id: None,
+            playing_sonicbox: false,
+            sonicbox_current: None,
+            sonicbox_vote_id: None,
+        }
+    }
+
+    // ── SonicBox forced-track API ───────────────────────────────────────────
+    /// Store/refresh the winning vote as the forced next track. Called by the
+    /// SonicBox watcher (background pre-cache + late authoritative re-check).
+    pub fn set_sonicbox_next(&mut self, track: TrackInfo, vote_id: String) {
+        self.forced_next = Some(track);
+        self.forced_vote_id = Some(vote_id);
+    }
+
+    /// Drop any pending forced track (no active winning vote anymore).
+    pub fn clear_sonicbox_next(&mut self) {
+        self.forced_next = None;
+        self.forced_vote_id = None;
+    }
+
+    pub fn forced_vote_id(&self) -> Option<&str> {
+        self.forced_vote_id.as_deref()
+    }
+
+    pub fn has_sonicbox_next(&self) -> bool {
+        self.forced_next.is_some()
+    }
+
+    /// Consume the forced track + its vote id (clears the slot).
+    pub fn take_sonicbox_next(&mut self) -> Option<(TrackInfo, String)> {
+        let vote = self.forced_vote_id.take();
+        self.forced_next.take().map(|t| (t, vote.unwrap_or_default()))
+    }
+
+    /// Mark that a SonicBox track is now playing; remembers the track (for its
+    /// real duration / id) and vote id so we can report the completion to
+    /// /player/play-report when it finishes.
+    pub fn set_playing_sonicbox(&mut self, track: TrackInfo, vote_id: String) {
+        self.playing_sonicbox = true;
+        self.sonicbox_current = Some(track);
+        self.sonicbox_vote_id = Some(vote_id);
+    }
+
+    /// Finish the SonicBox track: returns (track, vote_id) for reporting.
+    pub fn clear_playing_sonicbox(&mut self) -> Option<(TrackInfo, String)> {
+        self.playing_sonicbox = false;
+        let track = self.sonicbox_current.take();
+        let vote = self.sonicbox_vote_id.take();
+        match (track, vote) {
+            (Some(t), Some(v)) => Some((t, v)),
+            _ => None,
         }
     }
 
@@ -306,8 +365,15 @@ impl AudioPlayer {
     pub fn is_finished(&self) -> bool {
         // Position-based fallback: if position >= duration - 0.5s, consider finished
         // This handles cases where rodio sink.empty() doesn't return true reliably
-        // Skip for spots (spot duration unknown, rely on sink.empty() only)
-        if !self.playing_spot {
+        // Skip for spots (spot duration unknown, rely on sink.empty() only).
+        // For a SonicBox track use its own duration, not the playlist track's.
+        if self.playing_sonicbox {
+            if let Some(track) = &self.sonicbox_current {
+                if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
+                    return true;
+                }
+            }
+        } else if !self.playing_spot {
             if let Some(track) = self.current_track() {
                 if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
                     return true;
@@ -316,6 +382,11 @@ impl AudioPlayer {
         }
 
         if !self.audio_available {
+            if self.playing_sonicbox {
+                if let Some(track) = &self.sonicbox_current {
+                    return self.get_position() >= track.duration;
+                }
+            }
             if let Some(track) = self.current_track() {
                 return self.get_position() >= track.duration;
             }
@@ -397,6 +468,16 @@ pub fn set_volume(vol: u8) -> Result<(), String> {
     Ok(())
 }
 
+// P0-2: audio pre-flight. Returns false when no output device could be opened
+// at startup (no ALSA/Pulse/PipeWire sink) so the UI can warn instead of
+// silently "playing" into the void.
+pub fn is_available() -> bool {
+    player()
+        .lock()
+        .map(|p| p.audio_available)
+        .unwrap_or(false)
+}
+
 pub fn toggle() -> Result<String, String> {
     let mut p = player().lock().map_err(|e| e.to_string())?;
     if p.is_playing() {
@@ -409,5 +490,86 @@ pub fn toggle() -> Result<String, String> {
         }
         p.resume();
         Ok("playing".into())
+    }
+}
+
+#[cfg(test)]
+mod sonicbox_tests {
+    use super::*;
+
+    fn track(id: &str, dur: f32) -> TrackInfo {
+        TrackInfo {
+            track_id: id.to_string(),
+            title: format!("Track {id}"),
+            artist: "Tester".to_string(),
+            file_path: format!("/tmp/{id}.mp3"),
+            duration: dur,
+            artwork_url: None,
+        }
+    }
+
+    // On the CI/headless host there is no audio device, so AudioPlayer runs in
+    // simulated mode (audio_available=false): play_file() succeeds without
+    // touching the file and is_finished() is driven purely by position vs the
+    // track's own duration. That's exactly what we need to test the SonicBox
+    // state machine deterministically.
+
+    #[test]
+    fn staging_and_consuming_a_vote() {
+        let mut p = AudioPlayer::new();
+        assert!(!p.has_sonicbox_next());
+
+        p.set_sonicbox_next(track("voted-1", 180.0), "vote-abc".to_string());
+        assert!(p.has_sonicbox_next());
+        assert_eq!(p.forced_vote_id(), Some("vote-abc"));
+
+        let (t, vote) = p.take_sonicbox_next().expect("forced track present");
+        assert_eq!(t.track_id, "voted-1");
+        assert_eq!(vote, "vote-abc");
+        assert!(!p.has_sonicbox_next(), "slot cleared after take");
+    }
+
+    #[test]
+    fn clearing_an_absent_vote_is_safe() {
+        let mut p = AudioPlayer::new();
+        p.set_sonicbox_next(track("voted-1", 10.0), "v1".to_string());
+        p.clear_sonicbox_next();
+        assert!(!p.has_sonicbox_next());
+        assert!(p.take_sonicbox_next().is_none());
+    }
+
+    #[test]
+    fn voted_track_finishes_on_its_own_duration_then_resumes_grid() {
+        let mut p = AudioPlayer::new();
+        // Grid: two normal tracks, currently on index 0.
+        p.set_playlist(vec![track("grid-0", 200.0), track("grid-1", 200.0)]);
+        assert_eq!(p.current_index, 0);
+
+        // A vote is staged and then consumed at the (simulated) end of grid-0.
+        p.set_sonicbox_next(track("voted-x", 1.5), "vote-x".to_string());
+        let (sb, vote) = p.take_sonicbox_next().unwrap();
+        p.play_file(&sb).expect("simulated play ok");
+        p.set_playing_sonicbox(sb, vote);
+        assert!(p.playing_sonicbox);
+
+        // Right after start it is NOT finished (uses the SB track's 1.5s, not
+        // the grid track's 200s).
+        assert!(!p.is_finished(), "voted track should still be playing");
+
+        // After its own duration elapses, it IS finished.
+        std::thread::sleep(std::time::Duration::from_millis(1700));
+        assert!(p.is_finished(), "voted track should be finished by its own duration");
+
+        // Closing the loop hands back the vote id for /player/play-report.
+        let (done_track, done_vote) = p.clear_playing_sonicbox().expect("sb bookkeeping");
+        assert_eq!(done_track.track_id, "voted-x");
+        assert_eq!(done_vote, "vote-x");
+        assert!(!p.playing_sonicbox);
+
+        // Grid resumes: advance moves to grid-1 (the vote did NOT consume a
+        // grid slot — index was still 0 during the interrupt).
+        assert!(p.advance());
+        assert_eq!(p.current_index, 1);
+        assert_eq!(p.current_track().unwrap().track_id, "grid-1");
     }
 }

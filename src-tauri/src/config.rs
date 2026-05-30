@@ -50,12 +50,21 @@ pub fn global() -> &'static Mutex<AppConfig> {
 impl AppConfig {
     fn load_from_disk() -> Self {
         let path = Self::config_path();
-        if path.exists() {
-            let data = std::fs::read_to_string(&path).unwrap_or_default();
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            Self::default()
+        let parse = |p: &PathBuf| -> Option<Self> {
+            let data = std::fs::read_to_string(p).ok()?;
+            serde_json::from_str(&data).ok()
+        };
+        if let Some(cfg) = parse(&path) {
+            return cfg;
         }
+        // R-17: primary config missing/corrupt — fall back to the last good
+        // backup before giving up (giving up = losing the pairing).
+        let bak = path.with_extension("json.bak");
+        if let Some(cfg) = parse(&bak) {
+            eprintln!("[millsonic] config.json unreadable — restored from config.json.bak");
+            return cfg;
+        }
+        Self::default()
     }
 
     pub fn load() -> Self {
@@ -67,7 +76,17 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::to_string_pretty(self)?;
+        // R-17: atomic write + keep a backup of the last good config so a crash
+        // or full disk mid-write can't corrupt it and lose the pairing.
+        if let Ok(cur) = std::fs::read_to_string(&path) {
+            if serde_json::from_str::<AppConfig>(&cur).is_ok() {
+                let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -110,4 +129,36 @@ pub fn get_config() -> AppConfig {
 
 pub fn update_and_save_global<F: FnOnce(&mut AppConfig)>(f: F) {
     let _ = AppConfig::update_and_save(f);
+}
+
+#[cfg(test)]
+mod config_backup_tests {
+    use super::*;
+
+    // R-17: a corrupt config.json must be recovered from config.json.bak so the
+    // device never loses its pairing. Isolated via a temp XDG_CONFIG_HOME.
+    #[test]
+    fn restores_pairing_from_backup_when_main_is_corrupt() {
+        let tmp = std::env::temp_dir().join("ms_cfg_backup_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        // First good save → writes config.json (device_id = dev-1).
+        let mut c = AppConfig::default();
+        c.device_id = Some("dev-1".to_string());
+        c.save().unwrap();
+        // Second save → backs up the good config.json to .bak, then writes new.
+        c.zone_id = Some("zone-1".to_string());
+        c.save().unwrap();
+
+        // Corrupt the primary config.
+        std::fs::write(AppConfig::config_path(), b"{ this is not valid json").unwrap();
+
+        // Recovery: must come back with the pairing intact (from .bak).
+        let loaded = AppConfig::load_from_disk();
+        assert_eq!(loaded.device_id.as_deref(), Some("dev-1"));
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -104,6 +104,39 @@ pub async fn report_plays_batch(
     Ok(resp)
 }
 
+/// SonicBox — fetch the zone's now-playing payload (public endpoint).
+/// Returns the full JSON; the caller reads `sonicboxNext` + `nextTracks[0]`.
+pub async fn fetch_zone_now_playing(
+    zone_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client()
+        .get(format!("{}/zones/{}/now-playing", API_BASE, zone_id))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    Ok(resp)
+}
+
+/// SonicBox — report a completed play to the *real* player endpoint so the
+/// backend closes the vote loop (markPlayed) when completed && !skipped.
+/// Auth: the device's pairing `deviceToken` IS a signed device JWT, so we send
+/// it as a Bearer token. Body shape matches PlayReportDto { plays: [...] }.
+pub async fn report_player_play(
+    device_token: &str,
+    plays: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client()
+        .post(format!("{}/player/play-report", API_BASE))
+        .bearer_auth(device_token)
+        .json(&serde_json::json!({ "plays": plays }))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    Ok(resp)
+}
+
 pub async fn download_track(url: &str, dest_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -120,7 +153,21 @@ pub async fn download_track(url: &str, dest_path: &Path) -> Result<(), Box<dyn s
         return Err(format!("HTTP {} downloading track: {}", status, &body[..body.len().min(200)]).into());
     }
     let bytes = resp.bytes().await?;
+    // R-04: reject suspiciously small payloads (error pages / truncated bodies)
+    // so a corrupt file never lands in the cache and breaks playback later.
+    if bytes.len() < 2048 {
+        return Err(format!(
+            "download too small ({} bytes), likely not audio: {}",
+            bytes.len(),
+            dest_path.display()
+        )
+        .into());
+    }
+    // R-04: write to a temp file then atomically rename, so an interrupted
+    // download can never appear as a complete cached track.
+    let tmp_path = dest_path.with_extension("part");
+    std::fs::write(&tmp_path, &bytes)?;
+    std::fs::rename(&tmp_path, dest_path)?;
     log::info!("Downloaded {} bytes to {}", bytes.len(), dest_path.display());
-    std::fs::write(dest_path, &bytes)?;
     Ok(())
 }

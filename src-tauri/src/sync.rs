@@ -5,6 +5,83 @@ use chrono::{Datelike, Timelike, Utc};
 use chrono_tz;
 use tokio::sync::Notify;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+
+// ── SonicBox anti-repeat (R-12) ─────────────────────────────────────────────
+// A voted track must NEVER loop back-to-back. It may play again, but only after
+// at least SONICBOX_MIN_GAP_TRACKS other tracks have played. This guard is the
+// HARD guarantee: it holds even fully offline and even if the play-report (and
+// therefore the server-side markPlayed) never succeeds and the API keeps
+// returning the same vote/trackId.
+const SONICBOX_MIN_GAP_TRACKS: u64 = 4;
+
+// Monotonic count of tracks that have finished playing (grid + spot + sonicbox).
+static SB_TRACKS_PLAYED: AtomicU64 = AtomicU64::new(0);
+// trackId -> value of SB_TRACKS_PLAYED at the moment it last played via SonicBox.
+static SB_LAST_PLAYED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn sb_last_played() -> &'static Mutex<HashMap<String, u64>> {
+    SB_LAST_PLAYED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Increment the global "tracks played" counter (call once per finished track).
+fn sb_bump_tracks_played() -> u64 {
+    SB_TRACKS_PLAYED.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Remember that `track_id` just played via SonicBox (at the current count).
+fn sb_note_played(track_id: &str) {
+    let now = SB_TRACKS_PLAYED.load(Ordering::Relaxed);
+    let mut map = match sb_last_played().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    map.insert(track_id.to_string(), now);
+    // Prune entries well past the gap window to keep the map tiny.
+    map.retain(|_, &mut last| now.saturating_sub(last) <= SONICBOX_MIN_GAP_TRACKS * 4);
+}
+
+/// Pure decision: should we skip staging this track because it played too
+/// recently via SonicBox? `last` is the recorded count, `now` the current.
+fn sb_should_skip_repeat(last: Option<u64>, now: u64, gap: u64) -> bool {
+    match last {
+        Some(last) => now.saturating_sub(last) < gap,
+        None => false,
+    }
+}
+
+/// Has `track_id` played via SonicBox within the last SONICBOX_MIN_GAP_TRACKS?
+fn sb_recently_played(track_id: &str) -> bool {
+    let now = SB_TRACKS_PLAYED.load(Ordering::Relaxed);
+    let map = match sb_last_played().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    sb_should_skip_repeat(map.get(track_id).copied(), now, SONICBOX_MIN_GAP_TRACKS)
+}
+
+// ── Spot anti-repeat (R-06) ──────────────────────────────────────────────────
+// Remember the last spot we played so we don't fire the same announcement twice
+// in a row when several are eligible. People hate hearing the same ad on loop.
+static LAST_SPOT_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn last_spot_id() -> &'static Mutex<Option<String>> {
+    LAST_SPOT_ID.get_or_init(|| Mutex::new(None))
+}
+
+/// Pick a spot id from the eligible list that isn't the one we just played.
+/// Pure + testable: rotates past `last`; if the only eligible spot IS the last
+/// one, plays it anyway (can't leave dead air / skip a due ad).
+fn pick_spot<'a>(eligible: &'a [(String, String)], last: Option<&str>) -> Option<&'a (String, String)> {
+    if eligible.is_empty() {
+        return None;
+    }
+    eligible
+        .iter()
+        .find(|(id, _)| Some(id.as_str()) != last)
+        .or_else(|| eligible.first())
+}
 
 /// Connection status: Online, Offline (cached), Emergency
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +149,34 @@ pub fn trigger_sync() {
     sync_trigger().notify_one();
 }
 
+/// R-09: called right before an update restart so the upcoming hard restart
+/// doesn't lose queued play reports or cut audio mid-buffer. Flushes pending
+/// reports and stops playback cleanly.
+pub async fn flush_reports_before_exit() {
+    let cfg = config::AppConfig::load();
+    if let (Some(id), Some(token)) = (cfg.device_id.clone(), cfg.device_token.clone()) {
+        flush_pending_reports(&id, &token).await;
+    }
+    if let Ok(mut p) = audio::player().lock() {
+        p.stop();
+    }
+}
+
+/// R-04: remove any leftover partial download files (`*.part`) from the cache
+/// on startup, so a download interrupted by a crash/power-loss can't linger.
+pub fn sweep_partial_downloads() {
+    let dir = config::AppConfig::cache_dir();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("part") {
+                let _ = std::fs::remove_file(&p);
+                log::info!("Swept partial download: {}", p.display());
+            }
+        }
+    }
+}
+
 /// Track the current playlist ID to avoid restarting playback on re-sync
 static CURRENT_PLAYLIST_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -81,6 +186,9 @@ fn current_playlist_id() -> &'static Mutex<Option<String>> {
 
 pub async fn start_sync_loop(handle: AppHandle) {
     log::info!("Sync loop started");
+
+    // R-04: clean any partial downloads left by a previous crash/power-loss.
+    sweep_partial_downloads();
 
     // Init DB on first run
     let _ = db::db();
@@ -261,7 +369,11 @@ fn enter_emergency_mode(handle: &AppHandle) {
     }
 
     if playlist.is_empty() {
-        log::error!("Emergency mode: NO cached tracks available!");
+        // R-01: nothing cached at all (e.g. paired but never synced, then went
+        // offline). We can't conjure audio, but we must NOT give up silently:
+        // keep nudging a sync so the instant any content arrives, music starts.
+        log::error!("Emergency mode: NO cached tracks available — forcing sync to recover ASAP");
+        trigger_sync();
         return;
     }
 
@@ -635,6 +747,9 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
 
     let spots = db::load_spot_schedules();
 
+    // R-06: collect ALL eligible spots, then rotate past the last one played so
+    // the same announcement doesn't repeat back-to-back.
+    let mut eligible: Vec<(String, String)> = Vec::new();
     for (id, days_json, start_time, end_time, track_freq, _freq, start_date, end_date, file_path) in &spots {
         // Check file exists
         if !std::path::Path::new(file_path).exists() {
@@ -669,13 +784,176 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
             }
         }
 
-        log::info!("Spot eligible: {} (file: {})", id, file_path);
-        return Some(file_path.clone());
+        eligible.push((id.clone(), file_path.clone()));
     }
-    None
+
+    let last = last_spot_id().lock().ok().and_then(|g| g.clone());
+    let pick = pick_spot(&eligible, last.as_deref())?;
+    log::info!("Spot eligible: {} (file: {})", pick.0, pick.1);
+    if let Ok(mut g) = last_spot_id().lock() {
+        *g = Some(pick.0.clone());
+    }
+    Some(pick.1.clone())
 }
 
 /// Called from main.rs every second to check if track ended and advance
+/// SonicBox watcher — two tiers, mirroring how votes work in real life:
+///   Nivel 1 (background, ~every 11s): discover the current winning vote early
+///     and PRE-DOWNLOAD its audio so it's cached and ready in time.
+///   Nivel 2 (late authoritative, last ~8s of the current track): one fresh
+///     fetch so a last-moment vote change still gets in. Anything that changes
+///     in the final couple of seconds is intentionally ignored.
+/// The winner/queue ordering lives server-side (peekNext orders by credits);
+/// here we just ask "what's next?" and stage it as the forced next track.
+pub async fn start_sonicbox_loop(_handle: AppHandle) {
+    use std::time::Instant;
+    const TICK: Duration = Duration::from_secs(3);
+    const BG_INTERVAL_SECS: f32 = 11.0;
+    const LATE_WINDOW_SECS: f32 = 8.0;
+
+    let mut last_full_fetch = Instant::now() - Duration::from_secs(60);
+    let mut late_fetched_for: Option<String> = None;
+
+    loop {
+        tokio::time::sleep(TICK).await;
+
+        let cfg = config::AppConfig::load();
+        let zone_id = match cfg.zone_id.clone() {
+            Some(z) if !z.is_empty() => z,
+            _ => continue,
+        };
+
+        // Snapshot player state under a short lock.
+        let (cur_id, remaining, busy) = {
+            let p = match audio::player().lock() {
+                Ok(p) => p,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let cur_id = p.current_track().map(|t| t.track_id.clone()).unwrap_or_default();
+            let dur = p.current_track().map(|t| t.duration).unwrap_or(0.0);
+            let pos = p.get_position();
+            let remaining = if dur > 0.0 { dur - pos } else { f32::INFINITY };
+            // Don't stage a forced track while a spot or another voted track is
+            // already mid-interrupt.
+            let busy = p.playing_spot || p.playing_sonicbox || !p.is_playing();
+            (cur_id, remaining, busy)
+        };
+
+        let in_late_window = remaining <= LATE_WINDOW_SECS && !busy;
+        let due_background = last_full_fetch.elapsed().as_secs_f32() >= BG_INTERVAL_SECS;
+        let due_late = in_late_window && late_fetched_for.as_deref() != Some(cur_id.as_str());
+
+        if !(due_background || due_late) {
+            continue;
+        }
+        if due_late {
+            late_fetched_for = Some(cur_id.clone());
+            log::info!("SonicBox: late authoritative re-check ({:.1}s left on current track)", remaining);
+        }
+        last_full_fetch = Instant::now();
+
+        let json = match api::fetch_zone_now_playing(&zone_id).await {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("SonicBox: now-playing fetch failed: {}", e);
+                continue;
+            }
+        };
+
+        // Read the staged vote. The backend puts the voted entry in
+        // nextTracks[0] (with isSonicBox:true) and a summary in sonicboxNext.
+        let sb_entry = json
+            .get("nextTracks")
+            .and_then(|n| n.get(0))
+            .filter(|e| e.get("isSonicBox").and_then(|v| v.as_bool()).unwrap_or(false));
+
+        let sb_entry = match sb_entry {
+            Some(e) => e,
+            None => {
+                // No active winning vote — drop any previously staged track.
+                let mut p = match audio::player().lock() {
+                    Ok(p) => p,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if p.has_sonicbox_next() {
+                    log::info!("SonicBox: no active vote, clearing staged track");
+                    p.clear_sonicbox_next();
+                }
+                continue;
+            }
+        };
+
+        let track_id = sb_entry.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let vote_id = sb_entry
+            .get("voteId")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("sonicboxNext").and_then(|s| s.get("voteId")).and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string();
+        if track_id.is_empty() {
+            continue;
+        }
+
+        // R-12 (anti-repeat): if this track already played via SonicBox within
+        // the last SONICBOX_MIN_GAP_TRACKS, do NOT re-stage it — even if the API
+        // keeps returning the same vote because markPlayed hasn't landed yet.
+        // This is what stops a voted track from looping back-to-back.
+        if sb_recently_played(&track_id) {
+            log::info!(
+                "SonicBox: skipping repeat of track {} (played <{} tracks ago)",
+                track_id, SONICBOX_MIN_GAP_TRACKS
+            );
+            let mut p = match audio::player().lock() {
+                Ok(p) => p,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if p.has_sonicbox_next() {
+                p.clear_sonicbox_next();
+            }
+            continue;
+        }
+
+        let title = sb_entry.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let artist = sb_entry.get("artist").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let duration = sb_entry.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+        let artwork_url = sb_entry.get("coverUrl").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let stream_url = sb_entry.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Ensure the audio file is cached (pre-download). Same cache layout as
+        // the playlist: cache_dir/<trackId>.mp3.
+        let cache_dir = config::AppConfig::cache_dir();
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let file_path = cache_dir.join(format!("{}.mp3", track_id));
+        if !file_path.exists() {
+            if stream_url.is_empty() {
+                log::warn!("SonicBox: voted track {} not cached and no streamUrl", track_id);
+                continue;
+            }
+            log::info!("SonicBox: pre-downloading voted track '{}'", title);
+            if let Err(e) = api::download_track(&stream_url, &file_path).await {
+                log::error!("SonicBox: failed to pre-download voted track: {}", e);
+                continue;
+            }
+        }
+
+        let track = audio::TrackInfo {
+            track_id: track_id.clone(),
+            title,
+            artist,
+            file_path: file_path.to_string_lossy().to_string(),
+            duration,
+            artwork_url,
+        };
+
+        let mut p = match audio::player().lock() {
+            Ok(p) => p,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        p.set_sonicbox_next(track, vote_id.clone());
+        log::info!("SonicBox: staged voted track {} (vote={}) as forced next", track_id, vote_id);
+    }
+}
+
 pub fn check_track_advancement(handle: &AppHandle) {
     let mut player = match audio::player().lock() {
         Ok(p) => p,
@@ -694,7 +972,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
 
     // Check crossfade trigger: if near end of track and crossfade enabled
     let cfg = config::AppConfig::load();
-    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot {
+    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot && !player.playing_sonicbox {
         // Clone track info to avoid borrow conflicts
         let track_info = player.current_track().cloned();
         let next_info = player.peek_next().cloned();
@@ -748,8 +1026,12 @@ pub fn check_track_advancement(handle: &AppHandle) {
     let position = player.get_position();
     let track_title = player.current_track().map(|t| t.title.clone()).unwrap_or_default();
     let track_dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
-    log::info!("Track '{}' finished at {:.1}s (duration={:.1}s, playing_spot={})", 
+    log::info!("Track '{}' finished at {:.1}s (duration={:.1}s, playing_spot={})",
         track_title, position, track_dur, player.playing_spot);
+
+    // R-12: count every finished track so the SonicBox anti-repeat gap can be
+    // measured in "tracks since". Covers grid, spot and sonicbox tracks.
+    sb_bump_tracks_played();
 
     // If a spot just finished, resume normal playback
     if player.playing_spot {
@@ -759,6 +1041,80 @@ pub fn check_track_advancement(handle: &AppHandle) {
         player.advance(); // Move to NEXT track (previous track already finished before spot)
         if let Err(e) = player.play_current() {
             log::error!("Error resuming after spot: {}", e);
+        }
+        if let Some(track) = player.current_track() {
+            let _ = handle.emit("now-playing", serde_json::json!({
+                "title": track.title,
+                "artist": track.artist,
+                "duration": track.duration,
+                "position": 0.0,
+                "artworkUrl": track.artwork_url,
+            }));
+        }
+        return;
+    }
+
+    // SonicBox: a voted track just finished. Close the vote loop by reporting
+    // the completion to the REAL player endpoint (/player/play-report), then
+    // resume the normal grid from the track that would have played next.
+    if player.playing_sonicbox {
+        let sb_pos = player.get_position();
+        if let Some((sb_track, vote_id)) = player.clear_playing_sonicbox() {
+            // completed = played most of it (not skipped early). Backend only
+            // closes the loop when completed && !skipped.
+            let completed = sb_track.duration > 1.0 && sb_pos >= sb_track.duration * 0.8;
+            log::info!(
+                "SonicBox track '{}' finished at {:.1}s/{:.1}s (vote={}, completed={})",
+                sb_track.title, sb_pos, sb_track.duration, vote_id, completed
+            );
+            // R-12 (hard guarantee): remember this track played via SonicBox so
+            // the vigía won't re-stage it for the next SONICBOX_MIN_GAP_TRACKS,
+            // even if the play-report below never reaches the server.
+            sb_note_played(&sb_track.track_id);
+            let cfg_sb = config::AppConfig::load();
+            if let Some(token) = cfg_sb.device_token.clone() {
+                let track_id = sb_track.track_id.clone();
+                let started_at =
+                    (Utc::now() - chrono::Duration::seconds(sb_pos as i64)).to_rfc3339();
+                let dur = sb_pos.max(0.0) as i64;
+                tauri::async_runtime::spawn(async move {
+                    let play = serde_json::json!({
+                        "trackId": track_id,
+                        "startedAt": started_at,
+                        "duration": dur,
+                        "completed": completed,
+                        "skipped": !completed,
+                    });
+                    // R-12 (soft cleanup): retry so markPlayed closes the vote
+                    // server-side. The local guard already prevents a loop if
+                    // every attempt fails.
+                    let mut sent = false;
+                    for attempt in 1..=3u32 {
+                        match api::report_player_play(&token, vec![play.clone()]).await {
+                            Ok(_) => {
+                                log::info!("SonicBox: play-report sent (completed={}, attempt={})", completed, attempt);
+                                sent = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("SonicBox: play-report attempt {}/3 failed: {}", attempt, e);
+                                tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
+                            }
+                        }
+                    }
+                    if !sent {
+                        log::error!("SonicBox: play-report failed after 3 attempts — local anti-repeat guard still active");
+                    }
+                });
+            } else {
+                log::warn!("SonicBox: no device_token, cannot close vote loop");
+            }
+        }
+        // Resume the grid: advance to the track that follows the one the vote
+        // interrupted, and play it.
+        player.advance();
+        if let Err(e) = player.play_current() {
+            log::error!("Error resuming grid after SonicBox track: {}", e);
         }
         if let Some(track) = player.current_track() {
             let _ = handle.emit("now-playing", serde_json::json!({
@@ -813,16 +1169,58 @@ pub fn check_track_advancement(handle: &AppHandle) {
     };
 
     if consecutive_skips >= playlist_len && playlist_len > 0 {
-        log::error!("All {} tracks failed to play. Stopping.", playlist_len);
-        player.stop();
-        let _ = handle.emit("now-playing", serde_json::json!({
-            "title": "Error de reproducción",
-            "artist": "No se pudieron reproducir las pistas",
-            "duration": 0,
-            "position": 0,
-            "artworkUrl": null,
-        }));
+        // R-02: NEVER hard-stop into dead air. Every track in the current grid
+        // failed (corrupt/missing cache) — recover instead: force a re-sync to
+        // re-download, and meanwhile fall back to an emergency shuffle of ALL
+        // cached tracks (other slots/playlists may have working files). Reset
+        // the skip counter so playback keeps trying rather than freezing.
+        log::error!(
+            "All {} grid tracks failed — recovering (re-sync + emergency shuffle), NOT stopping",
+            playlist_len
+        );
+        player.consecutive_skips = 0;
+        drop(player);
+        trigger_sync();
+        enter_emergency_mode(handle);
         return;
+    }
+
+    // ── SonicBox: a winning vote takes the slot right after the current track
+    // ends, ahead of any spot. We play it as an interrupt (like a spot): the
+    // playlist index is NOT advanced here — it advances when the voted track
+    // finishes, so the grid resumes exactly where it left off.
+    if player.has_sonicbox_next() {
+        if let Some((sb_track, vote_id)) = player.take_sonicbox_next() {
+            match player.play_file(&sb_track) {
+                Ok(_) => {
+                    log::info!(
+                        "SonicBox: playing voted track '{}' by '{}' (vote={})",
+                        sb_track.title, sb_track.artist, vote_id
+                    );
+                    player.set_playing_sonicbox(sb_track.clone(), vote_id);
+                    // R-12: mark as played the moment it STARTS, so a background
+                    // poll mid-playback can't re-stage the same track and cause
+                    // a back-to-back loop.
+                    sb_note_played(&sb_track.track_id);
+                    let _ = handle.emit("now-playing", serde_json::json!({
+                        "title": sb_track.title,
+                        "artist": sb_track.artist,
+                        "duration": sb_track.duration,
+                        "position": 0.0,
+                        "artworkUrl": sb_track.artwork_url,
+                        "isSonicBox": true,
+                    }));
+                    return;
+                }
+                Err(e) => {
+                    log::error!(
+                        "SonicBox: failed to play voted track '{}': {} — falling back to grid",
+                        sb_track.title, e
+                    );
+                    // fall through to normal spot/advance below
+                }
+            }
+        }
     }
 
     // Increment track counter
@@ -870,5 +1268,66 @@ pub fn check_track_advancement(handle: &AppHandle) {
             "position": 0.0,
             "artworkUrl": track.artwork_url,
         }));
+    }
+}
+
+#[cfg(test)]
+mod sonicbox_repeat_tests {
+    use super::*;
+
+    #[test]
+    fn never_skips_a_track_not_seen_before() {
+        assert!(!sb_should_skip_repeat(None, 100, SONICBOX_MIN_GAP_TRACKS));
+    }
+
+    #[test]
+    fn skips_within_the_gap_window() {
+        // played at 10, only 1 track later → must skip (would be a near-loop)
+        assert!(sb_should_skip_repeat(Some(10), 11, 4));
+        // played at 10, 3 tracks later → still inside gap of 4 → skip
+        assert!(sb_should_skip_repeat(Some(10), 13, 4));
+    }
+
+    #[test]
+    fn allows_again_once_the_gap_has_passed() {
+        // exactly gap tracks later → eligible again (Pablo: "después de 3-4 vuelve")
+        assert!(!sb_should_skip_repeat(Some(10), 14, 4));
+        assert!(!sb_should_skip_repeat(Some(10), 20, 4));
+    }
+
+    #[test]
+    fn spot_rotation_avoids_repeating_the_last() {
+        let eligible = vec![
+            ("spot-a".to_string(), "/a.mp3".to_string()),
+            ("spot-b".to_string(), "/b.mp3".to_string()),
+        ];
+        // last was A → must pick B
+        assert_eq!(pick_spot(&eligible, Some("spot-a")).unwrap().0, "spot-b");
+        // last was B → must pick A
+        assert_eq!(pick_spot(&eligible, Some("spot-b")).unwrap().0, "spot-a");
+        // none played yet → first
+        assert_eq!(pick_spot(&eligible, None).unwrap().0, "spot-a");
+    }
+
+    #[test]
+    fn spot_plays_anyway_if_its_the_only_eligible() {
+        let only = vec![("spot-a".to_string(), "/a.mp3".to_string())];
+        // even though A was the last, it's the only due ad → play it (no dead air)
+        assert_eq!(pick_spot(&only, Some("spot-a")).unwrap().0, "spot-a");
+        // empty → nothing
+        assert!(pick_spot(&[], Some("x")).is_none());
+    }
+
+    #[test]
+    fn global_guard_blocks_then_releases() {
+        // Self-contained against the shared global: use a unique id and relative
+        // reasoning so the starting counter value doesn't matter.
+        let id = "unit-test-track-xyz";
+        sb_note_played(id);
+        assert!(sb_recently_played(id), "just played → must be blocked");
+        for _ in 0..SONICBOX_MIN_GAP_TRACKS {
+            sb_bump_tracks_played();
+        }
+        assert!(!sb_recently_played(id), "after the gap → eligible again");
     }
 }

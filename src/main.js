@@ -217,6 +217,23 @@ async function setupListeners() {
     }
   });
 
+  // P0-2: surface a missing audio output device so the operator notices
+  // instead of seeing a player that "plays" with no sound.
+  await listen('audio-unavailable', (event) => {
+    const data = event.payload || {};
+    let banner = document.getElementById('audio-warning-banner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'audio-warning-banner';
+      banner.style.cssText =
+        'position:fixed;top:0;left:0;right:0;z-index:9999;background:#b00020;' +
+        'color:#fff;padding:8px 12px;font-size:13px;text-align:center;';
+      document.body.appendChild(banner);
+    }
+    banner.textContent =
+      '⚠ ' + (data.message || 'No se detectó dispositivo de audio. Revisá ALSA/PulseAudio/PipeWire.');
+  });
+
   await listen('ws-status', (event) => {
     const data = event.payload;
     if (!data) return;

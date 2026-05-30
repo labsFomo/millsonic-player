@@ -10,6 +10,7 @@ mod ws;
 mod updater;
 
 use tauri::{Manager, Emitter};
+use tauri_plugin_autostart::ManagerExt;
 use std::time::Duration;
 use simplelog::{CombinedLogger, WriteLogger, LevelFilter, Config as LogConfig};
 use std::fs::OpenOptions;
@@ -44,8 +45,7 @@ fn get_status() -> serde_json::Value {
 }
 
 #[tauri::command]
-async fn pair_device(code: String) -> Result<serde_json::Value, String> {
-    log::info!("pair_device called with code: {}", code);
+async fn pair_device(app: tauri::AppHandle, code: String) -> Result<serde_json::Value, String> {
     log::info!("pair_device called with code: {}", code);
     let resp = api::pair_with_code(&code).await.map_err(|e| {
         log::error!("pair_device API error: {}", e);
@@ -87,6 +87,12 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
         // Trigger immediate sync after successful pairing
         log::info!("Triggering immediate sync...");
         sync::trigger_sync();
+        // P0-7: enable autostart so the player comes back on its own after a
+        // reboot — a paired retail box must start playing without a human.
+        match app.autolaunch().enable() {
+            Ok(_) => log::info!("Autostart enabled after pairing"),
+            Err(e) => log::warn!("Could not enable autostart: {}", e),
+        }
     } else {
         log::warn!("Pairing response missing device_id or token: {:?}", resp);
     }
@@ -95,13 +101,17 @@ async fn pair_device(code: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn unpair_device(pin: String) -> Result<(), String> {
+async fn unpair_device(app: tauri::AppHandle, pin: String) -> Result<(), String> {
     let cfg = config::AppConfig::load();
     let expected = cfg.unpair_pin.unwrap_or_default();
     if pin.trim().to_uppercase() != expected {
         return Err("PIN_MISMATCH".to_string());
     }
     log::info!("unpair_device called — PIN verified, clearing config and stopping playback");
+    // P0-7: stop autostarting once unpaired.
+    if let Err(e) = app.autolaunch().disable() {
+        log::warn!("Could not disable autostart: {}", e);
+    }
     if let Ok(mut player) = audio::player().lock() {
         player.stop();
         player.set_playlist(vec![]);
@@ -257,15 +267,35 @@ fn setup_logging() {
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("millsonic.log");
 
+    // P0-3: never panic on startup. If the log file can't be opened (read-only
+    // home, permission issue, full disk on a fresh box), fall back to a
+    // terminal logger so the app still boots instead of dying silently.
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
-        .expect("Cannot open log file");
+        .open(&log_path);
 
-    CombinedLogger::init(vec![
-        WriteLogger::new(LevelFilter::Info, LogConfig::default(), file),
-    ]).expect("Cannot init logger");
+    let init_result = match file {
+        Ok(file) => CombinedLogger::init(vec![
+            WriteLogger::new(LevelFilter::Info, LogConfig::default(), file),
+        ]),
+        Err(e) => {
+            eprintln!("[millsonic] WARN: cannot open log file {}: {e}. Logging to stderr.", log_path.display());
+            CombinedLogger::init(vec![
+                simplelog::TermLogger::new(
+                    LevelFilter::Info,
+                    LogConfig::default(),
+                    simplelog::TerminalMode::Stderr,
+                    simplelog::ColorChoice::Never,
+                ),
+            ])
+        }
+    };
+
+    if let Err(e) = init_result {
+        // Logger already initialised or unavailable — not fatal, keep going.
+        eprintln!("[millsonic] WARN: logger init failed: {e}");
+    }
 
     log::info!("=== Millsonic Player started ===");
     log::info!("Log file: {}", log_path.display());
@@ -300,7 +330,16 @@ fn main() {
             let cfg = config::AppConfig::load();
             log::info!("About to init audio...");
             let _ = audio::set_volume(cfg.volume);
-            log::info!("Audio initialized OK");
+            // P0-2: audio pre-flight. Warn the UI if no output device exists so the
+            // operator sees it instead of a player that "plays" with no sound.
+            if audio::is_available() {
+                log::info!("Audio initialized OK");
+            } else {
+                log::error!("No audio output device available — playback will be silent");
+                let _ = app.handle().emit("audio-unavailable", serde_json::json!({
+                    "message": "No audio output device detected. Check ALSA/PulseAudio/PipeWire."
+                }));
+            }
 
             // Start update checker loop
             let handle_update = app.handle().clone();
@@ -328,6 +367,12 @@ fn main() {
             let handle_ws = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 ws::start_ws_loop(handle_ws).await;
+            });
+
+            // Start SonicBox watcher (vote-aware forced next track)
+            let handle_sb = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                sync::start_sonicbox_loop(handle_sb).await;
             });
 
             // Start HTTP polling fallback (active when WS is disconnected)
@@ -381,7 +426,9 @@ fn main() {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
                 loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    // R-07: check every 15s so a stuck player recovers in ~30s
+                    // (2 checks) instead of ~60s — half the worst-case dead-air.
+                    tokio::time::sleep(Duration::from_secs(15)).await;
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let is_playing = audio::player().try_lock()
@@ -405,8 +452,8 @@ fn main() {
                         let stuck = WATCHDOG_STUCK_COUNT.fetch_add(1, Ordering::Relaxed);
 
                         if stuck >= 2 {
-                            // Stuck for >60s (2 checks × 30s), force restart playback
-                            log::error!("WATCHDOG: Audio stuck for >60s at position {}cs, force-restarting!", current_pos);
+                            // Stuck for ~30s (2 checks × 15s), force restart playback
+                            log::error!("WATCHDOG: Audio stuck for ~30s at position {}cs, force-restarting!", current_pos);
                             if let Ok(mut player) = audio::player().lock() {
                                 // Force stop current playback
                                 player.stop();

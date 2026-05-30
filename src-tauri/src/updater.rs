@@ -84,10 +84,14 @@ pub async fn install_update(app: AppHandle) -> Result<String, String> {
                 e.to_string()
             })?;
 
-            log::info!("Update installed, restarting...");
+            log::info!("Update installed, flushing reports + stopping audio before restart...");
             let _ = app.emit("update-progress", serde_json::json!({
                 "phase": "restarting",
             }));
+
+            // R-09: graceful — flush pending play reports and stop playback
+            // cleanly so the restart doesn't lose data or cut mid-buffer.
+            crate::sync::flush_reports_before_exit().await;
 
             // Restart the app
             app.restart();
