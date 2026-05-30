@@ -184,6 +184,23 @@ fn current_playlist_id() -> &'static Mutex<Option<String>> {
     CURRENT_PLAYLIST_ID.get_or_init(|| Mutex::new(None))
 }
 
+// U6: fingerprint of the currently-loaded track list (ordered track ids). Lets
+// us detect when the SONGS of a playlist changed even though the playlist_id is
+// the same (admin edited its contents), so we reload instead of ignoring it.
+static CURRENT_TRACKS_FP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn current_tracks_fp() -> &'static Mutex<Option<String>> {
+    CURRENT_TRACKS_FP.get_or_init(|| Mutex::new(None))
+}
+
+fn tracks_fingerprint(tracks: &[serde_json::Value]) -> String {
+    let ids: Vec<&str> = tracks
+        .iter()
+        .map(|t| t.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+        .collect();
+    ids.join(",")
+}
+
 pub async fn start_sync_loop(handle: AppHandle) {
     log::info!("Sync loop started");
 
@@ -548,16 +565,24 @@ async fn do_sync(
         return Ok(());
     }
 
-    // Check if playlist changed
+    // Check if the playlist changed. U6: "same" requires BOTH the same
+    // playlist_id AND the same track list — if the songs were edited (added/
+    // removed/reordered) under the same id, we must reload, not just re-cache.
+    let new_fp = tracks_fingerprint(&current_tracks);
     let same_playlist = {
-        let cur = current_playlist_id().lock().unwrap();
-        cur.as_deref() == playlist_id.as_deref()
+        let cur_id = current_playlist_id().lock().unwrap();
+        let cur_fp = current_tracks_fp().lock().unwrap();
+        cur_id.as_deref() == playlist_id.as_deref()
+            && cur_fp.as_deref() == Some(new_fp.as_str())
     };
 
     if same_playlist {
-        log::info!("Same playlist still active, refreshing track cache only");
+        log::info!("Same playlist + same tracks, refreshing cache only");
         refresh_track_cache(&current_tracks).await;
         return Ok(());
+    }
+    if current_playlist_id().lock().unwrap().as_deref() == playlist_id.as_deref() {
+        log::info!("Same playlist id but TRACK LIST CHANGED — reloading playlist (U6)");
     }
 
     // Different playlist or first sync — download and start playing
@@ -665,6 +690,7 @@ async fn do_sync(
             first_track_started = true;
         }
         *current_playlist_id().lock().unwrap() = playlist_id;
+        *current_tracks_fp().lock().unwrap() = Some(new_fp.clone());
         let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
     }
 

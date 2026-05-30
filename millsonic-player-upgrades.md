@@ -99,7 +99,67 @@ queda en blanco y pasa a now-playing en pocos segundos. Probar en la GPU Intel r
 
 ---
 
-### U6 — Cambios de canciones en una playlist existente no se aplican hasta reiniciar  ·  🔴 P1
+### U7 — Manejo y presentación de errores (nunca mostrar un error crudo en blanco)  ·  🔴 P1
+**Qué pasa hoy:** ante una falla, la WebView puede mostrar un **error crudo de browser sobre
+fondo blanco**, ej:
+```
+Could not connect to localhost: Connection refused
+```
+(se vio en la PC real). Es **horrible para retail** — parece roto y no le dice nada útil al
+operario. No hay ningún manejo de error con diseño propio.
+
+> **Causa del caso puntual visto:** un binario construido con `cargo build` directo (sin
+> embeber el frontend de producción) apuntó al `devUrl` (`localhost:1420`). Eso fue un error
+> de build/deploy nuestro (se arregla construyendo con `tauri build`/`npm run build`, ver nota
+> de build abajo). **Pero independientemente de la causa, el player nunca debería exponer un
+> error así.**
+
+**Comportamiento esperado (lo que pidió Pablo):** ningún error crudo. Ante una falla, el
+player debe seguir **nuestro diseño** y hacer una de estas, según gravedad:
+- **Seguir / reintentar** en silencio si es transitorio (ej: sin red → modo offline, ya
+  existe a nivel audio; la UI debe mostrar un estado branded "sin conexión", no un error).
+- **Auto-reiniciar la app** si la UI/WebView quedó en mal estado (pantalla en blanco, assets
+  no cargaron).
+- **Pantalla de error branded** con **código de error** + "Contactá a soporte" (+ reintentar
+  / reiniciar), con el logo de Millsonic — nunca el error de browser pelado.
+
+**Solución propuesta:**
+1. **Rust:** detectar fallo de carga del WebView / pantalla en blanco (evento de load del
+   webview, o un watchdog que verifica que el front respondió un "ready"). Si falla →
+   reintentar cargar / `app.restart()` / mostrar un diálogo nativo branded con código.
+2. **Frontend (`main.js`):** error boundary global (capturar errores JS + `unhandledrejection`)
+   que renderiza una **vista de error con diseño** (logo + mensaje claro + `ERROR CODE` +
+   acción), en vez de dejar el error crudo.
+3. **Esquema de códigos de error** (ej: `E-NET-001` conexión, `E-UI-002` carga de UI,
+   `E-AUD-003` audio) para que soporte sepa qué pasó de un vistazo.
+4. Toda pantalla de "estado feo" (sin programación, sin audio, error de reproducción) pasa a
+   tener el mismo lenguaje visual branded.
+
+**Dónde tocar:** `src/main.js` (error boundary + componente de error branded),
+`src/index.html`/`styles.css` (estilo), `src-tauri/src/main.rs` (detección de WebView caído +
+auto-restart + diálogo nativo de fallback).
+
+**Cómo verificar:** forzar fallas (sin red al boot, frontend que no carga, audio ausente) y
+confirmar que **siempre** se ve una pantalla branded con mensaje claro + código, nunca un
+error crudo ni un blanco.
+
+---
+
+### 🛠️ Nota de build/deploy (para no repetir el error de hoy)
+**SIEMPRE construir el player con `npm run build` (= `tauri build`), NUNCA con `cargo build`
+directo para distribuir.** `cargo build` no embebe el frontend de producción y el binario
+apunta al `devUrl` (`localhost:1420`) → pantalla "Could not connect to localhost". El `.deb`
+correcto sale de `npm run build -- --bundles deb`. (`cargo build`/`cargo test` solo sirven
+para validar compilación y correr tests de Rust, no para deployar.)
+
+---
+
+### U6 — Cambios de canciones en una playlist existente no se aplican hasta reiniciar  ·  ✅✅ PROBADO · P1
+**Implementado** (fingerprint de la lista de tracks en `sync.rs`; el early-return de "misma
+playlist" ahora requiere mismo id **y** mismo contenido). **Probado en la PC real
+(2026-05-30):** se quitó 1 track de la playlist activa (30→29) + force-sync → el player logueó
+`Same playlist id but TRACK LIST CHANGED — reloading playlist (U6)` y recargó. ✓
+
 **Qué pasa hoy:** cuando el player sincroniza y la **playlist activa tiene el mismo
 `playlist_id`** que la que ya está cargada, ejecuta el path de "misma playlist"
 (`sync.rs:557-560`): solo llama `refresh_track_cache()` (descarga archivos faltantes) y
@@ -287,6 +347,8 @@ R-17 (config con backup). Más: SonicBox Desktop CAMBIO 1-4, P0-2/3/7.
    "siempre arranca la misma canción desde 0".
 3. **U6 (cambios de canciones en playlist se apliquen sin reiniciar)** — propaga edits de
    contenido en ~60s, no al próximo slot/reinicio.
+3b. **U7 (manejo de errores branded)** — nunca un error crudo en blanco; reintento /
+   auto-restart / pantalla branded con código + soporte. Retail-critical.
 4. **U1 (descarga progresiva)** — el que más mueve la aguja para "música ASAP".
 5. **U2 (render WebView)** — para que la pantalla nunca se vea rota en GPUs Intel.
 6. **R-10/R-11/R-18** (backend) — sincronía multi-sucursal + token, cuando ataquemos backend.
