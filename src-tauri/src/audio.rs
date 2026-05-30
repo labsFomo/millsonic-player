@@ -109,6 +109,15 @@ impl AudioPlayer {
         self.forced_vote_id.as_deref()
     }
 
+    /// The SonicBox track currently playing (for crossfade duration/reporting).
+    pub fn sonicbox_current(&self) -> Option<&TrackInfo> {
+        self.sonicbox_current.as_ref()
+    }
+
+    pub fn sonicbox_vote_id(&self) -> Option<&str> {
+        self.sonicbox_vote_id.as_deref()
+    }
+
     pub fn has_sonicbox_next(&self) -> bool {
         self.forced_next.is_some()
     }

@@ -1183,45 +1183,101 @@ pub fn check_track_advancement(handle: &AppHandle) {
     // Update crossfade volumes if active
     player.update_crossfade();
 
-    // Check crossfade trigger: if near end of track and crossfade enabled
+    // R-13: crossfade trigger — near the end of WHATEVER is playing (grid track
+    // OR SonicBox voted track), crossfade into whatever plays next, so there's
+    // NEVER a hard cut: grid→grid, grid→SonicBox, and SonicBox→grid all crossfade.
+    // Config (enabled/duration) comes from the API per zone/device.
     let cfg = config::AppConfig::load();
-    // R-13: also hold off crossfade when a SonicBox vote is STAGED to play next
-    // — otherwise crossfade would slide into the grid's next track and the voted
-    // track would be skipped. Letting the track finish naturally lets the
-    // SonicBox injection play the voted song.
-    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot
-        && !player.playing_sonicbox && !player.has_sonicbox_next() {
-        // Clone track info to avoid borrow conflicts
-        let track_info = player.current_track().cloned();
-        let next_info = player.peek_next().cloned();
-        if let (Some(track), Some(next)) = (track_info, next_info) {
-            let position = player.get_position();
-            let crossfade_point = track.duration - cfg.crossfade_duration as f32;
+    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot {
+        let position = player.get_position();
+        let cur_track = if player.playing_sonicbox {
+            player.sonicbox_current().cloned()
+        } else {
+            player.current_track().cloned()
+        };
+        if let Some(cur) = cur_track {
+            let crossfade_point = cur.duration - cfg.crossfade_duration as f32;
             if crossfade_point > 0.0 && position >= crossfade_point && !player.is_finished() {
-                log::info!("Starting crossfade at {:.1}s (track duration {:.1}s)", position, track.duration);
-                if let Err(e) = player.start_crossfade(&next) {
-                    log::error!("Crossfade failed: {}", e);
-                } else {
-                    // Record play report for outgoing track
-                    let zone_id = cfg.zone_id.as_deref().unwrap_or("");
-                    let started_at = Utc::now().to_rfc3339();
-                    db::save_play_report(&track.track_id, zone_id, &started_at, position as f64);
-                    db::touch_track(&track.track_id);
-                    // Advance index
-                    player.advance();
-                    player.tracks_since_last_spot += 1;
-                    player.reset_position();
-                    // Emit now-playing for new track
-                    if let Some(t) = player.current_track() {
-                        let _ = handle.emit("now-playing", serde_json::json!({
-                            "title": t.title,
-                            "artist": t.artist,
-                            "duration": t.duration,
-                            "position": 0.0,
-                            "artworkUrl": t.artwork_url,
-                        }));
+                let zone_id = cfg.zone_id.clone().unwrap_or_default();
+                let started_at = Utc::now().to_rfc3339();
+
+                if player.playing_sonicbox {
+                    // ── C: SonicBox track ending → crossfade into the grid next,
+                    //       close the vote loop, resume the grid.
+                    if let Some(next) = player.peek_next().cloned() {
+                        if let Err(e) = player.start_crossfade(&next) {
+                            log::error!("Crossfade (sb->grid) failed: {}", e);
+                        } else {
+                            let completed = cur.duration > 1.0 && position >= cur.duration * 0.8;
+                            sb_note_played(&cur.track_id);
+                            if let Some(token) = cfg.device_token.clone() {
+                                let track_id = cur.track_id.clone();
+                                let dur = position.max(0.0) as i64;
+                                let sa = started_at.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let play = serde_json::json!({
+                                        "trackId": track_id, "startedAt": sa, "duration": dur,
+                                        "completed": completed, "skipped": !completed,
+                                    });
+                                    let _ = api::report_player_play(&token, vec![play]).await;
+                                });
+                            }
+                            log::info!("Crossfade SonicBox '{}' -> grid '{}'", cur.title, next.title);
+                            player.clear_playing_sonicbox();
+                            player.advance();
+                            player.tracks_since_last_spot += 1;
+                            player.reset_position();
+                            if let Some(t) = player.current_track() {
+                                let _ = handle.emit("now-playing", serde_json::json!({
+                                    "title": t.title, "artist": t.artist, "duration": t.duration,
+                                    "position": 0.0, "artworkUrl": t.artwork_url,
+                                }));
+                            }
+                            return;
+                        }
                     }
-                    return;
+                } else if player.has_sonicbox_next() {
+                    // ── B: grid track ending + vote staged → crossfade INTO the
+                    //       voted track (no skip, no hard cut).
+                    if let Some((sb, vote)) = player.take_sonicbox_next() {
+                        if let Err(e) = player.start_crossfade(&sb) {
+                            log::error!("Crossfade (grid->sb) failed: {}", e);
+                            player.set_sonicbox_next(sb, vote); // put it back for the finish path
+                        } else {
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::touch_track(&cur.track_id);
+                            log::info!("Crossfade grid '{}' -> SonicBox '{}' (vote={})", cur.title, sb.title, vote);
+                            sb_note_played(&sb.track_id);
+                            let sb_clone = sb.clone();
+                            player.set_playing_sonicbox(sb_clone, vote);
+                            player.reset_position();
+                            let _ = handle.emit("now-playing", serde_json::json!({
+                                "title": sb.title, "artist": sb.artist, "duration": sb.duration,
+                                "position": 0.0, "artworkUrl": sb.artwork_url, "isSonicBox": true,
+                            }));
+                            return;
+                        }
+                    }
+                } else {
+                    // ── A: normal grid → grid.
+                    if let Some(next) = player.peek_next().cloned() {
+                        if let Err(e) = player.start_crossfade(&next) {
+                            log::error!("Crossfade failed: {}", e);
+                        } else {
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::touch_track(&cur.track_id);
+                            player.advance();
+                            player.tracks_since_last_spot += 1;
+                            player.reset_position();
+                            if let Some(t) = player.current_track() {
+                                let _ = handle.emit("now-playing", serde_json::json!({
+                                    "title": t.title, "artist": t.artist, "duration": t.duration,
+                                    "position": 0.0, "artworkUrl": t.artwork_url,
+                                }));
+                            }
+                            return;
+                        }
+                    }
                 }
             }
         }

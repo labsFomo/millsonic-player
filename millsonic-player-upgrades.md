@@ -368,7 +368,7 @@ R-17 (config con backup). Más: SonicBox Desktop CAMBIO 1-4, P0-2/3/7.
 
 ---
 
-### U8 — Update remoto (auto-update): cómo testearlo de verdad  ·  🟡 INFRA LISTA, FALTA TEST E2E
+### U8 — Update remoto (auto-update)  ·  ✅✅ PROBADO E2E (0.8.3→0.8.4 en la PC)
 **Qué hay (todo implementado):** `tauri-plugin-updater` con pubkey + endpoint
 `GET /devices/update/{target}/{arch}/{version}` (que devuelve `latest.json` o **204** si
 estás al día). El **CI** (`.github/workflows/build.yml`) en un **push de tag `vX.Y.Z`**:
