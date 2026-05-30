@@ -327,9 +327,12 @@ Estos ya están mapeados en `PLAYER_SANTO_GRIAL.md`. Se listan acá para tener U
 - **R-08 — Prioridad del proceso/hilo de audio**  ·  🔴 P2
   Bajo CPU 100% puede haber micro-cortes >500 ms. Mitigar con prioridad de proceso (`nice`/
   scheduling) y hardware mínimo garantizado.
-- **R-13 — Crossfade + SonicBox**  ·  🟡 P2 (parcial)
-  Ya se evita disparar crossfade durante SonicBox (`sync.rs`). Falta revisar el caso
-  crossfade activo + interrupción de spot/voto para no perder un track. Verificar.
+- **R-13 — Crossfade + SonicBox**  ·  ✅ LISTO (0.8.4)
+  Era un **bug real**: con crossfade ON, el crossfade usaba `peek_next()` (el próximo de la
+  GRILLA) y avanzaba → **el tema SonicBox votado se salteaba**. El guard chequeaba
+  `playing_sonicbox` (si ya sonaba) pero no `has_sonicbox_next()` (si estaba stageado). Fix:
+  el crossfade ahora también se inhibe con `!has_sonicbox_next()` → la canción termina natural
+  y la inyección SonicBox toca el voto. (`sync.rs`)
 - **R-15 — Backoff del vigía SonicBox en offline**  ·  🔴 P2
   El vigía pollea cada ~3 s aunque no haya red. Agregar backoff exponencial / consultar
   `ConnectionStatus` antes de pollear, para no gastar CPU/red.
