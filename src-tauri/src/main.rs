@@ -398,6 +398,12 @@ fn main() {
                 sync::start_sonicbox_loop(handle_sb).await;
             });
 
+            // Start position re-sync loop (R-10: keep branches converged)
+            let handle_rs = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                sync::start_resync_loop(handle_rs).await;
+            });
+
             // Start HTTP polling fallback (active when WS is disconnected)
             let handle_poll = app.handle().clone();
             tauri::async_runtime::spawn(async move {

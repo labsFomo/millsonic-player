@@ -453,6 +453,30 @@ impl AudioPlayer {
         }
     }
 
+    /// R-10: if the player drifted to a DIFFERENT song than the server says is
+    /// current, jump to the right one (+ seek). No-op if already on the right
+    /// song or if a spot / SonicBox track is mid-interrupt. Returns the current
+    /// track id (for the caller to know what's playing) and whether it jumped.
+    pub fn current_track_id(&self) -> Option<String> {
+        self.playlist.get(self.current_index).map(|t| t.track_id.clone())
+    }
+
+    pub fn resync_to(&mut self, track_id: &str, seek_secs: f32) -> bool {
+        if self.playing_spot || self.playing_sonicbox {
+            return false;
+        }
+        let cur = self.playlist.get(self.current_index).map(|t| t.track_id.as_str());
+        if cur == Some(track_id) {
+            return false; // already on the right song — never jump mid-song
+        }
+        if let Some(idx) = self.playlist.iter().position(|t| t.track_id == track_id) {
+            self.current_index = idx;
+            let _ = self.play_current_at(seek_secs);
+            return true;
+        }
+        false
+    }
+
     pub fn advance(&mut self) -> bool {
         if self.current_index + 1 < self.playlist.len() {
             self.current_index += 1;

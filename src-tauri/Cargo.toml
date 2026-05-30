@@ -1,6 +1,6 @@
 [package]
 name = "millsonic-player"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 default-run = "millsonic-player"
 
@@ -22,6 +22,7 @@ dirs = "5"
 chrono = "0.4"
 chrono-tz = "0.10"
 uuid = { version = "1", features = ["v4"] }
+base64 = "0.21"
 rand = "0.8"
 log = "0.4"
 simplelog = "0.12"

@@ -2382,8 +2382,9 @@ dependencies = [
 
 [[package]]
 name = "millsonic-player"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
+ "base64 0.21.7",
  "chrono",
  "chrono-tz",
  "dirs 5.0.1",

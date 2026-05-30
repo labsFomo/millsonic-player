@@ -5,8 +5,146 @@ use chrono::{Datelike, Timelike, Utc};
 use chrono_tz;
 use tokio::sync::Notify;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::collections::HashMap;
+
+// ── R-11: server clock offset ────────────────────────────────────────────────
+// The schedule position depends on time. If the box's system clock is wrong (no
+// NTP, DST mishap) the wrong song/second plays. The server's now-playing returns
+// `syncTimestamp` (ms epoch) — we treat that as the source of truth and keep an
+// offset so local time calcs (spot windows, offline fallback) use SERVER time.
+static SERVER_CLOCK_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+static SERVER_CLOCK_SYNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Update the offset from a server `syncTimestamp` (ms since epoch).
+fn update_clock_offset(server_ts_ms: i64) {
+    if server_ts_ms <= 0 { return; }
+    let local_ms = Utc::now().timestamp_millis();
+    let offset = server_ts_ms - local_ms;
+    SERVER_CLOCK_OFFSET_MS.store(offset, Ordering::Relaxed);
+    SERVER_CLOCK_SYNCED.store(true, Ordering::Relaxed);
+    if offset.abs() > 5000 {
+        log::warn!("R-11: device clock off by {}ms vs server — using server time", offset);
+    }
+}
+
+/// Current time corrected to the server clock (falls back to local if never synced).
+fn server_now() -> chrono::DateTime<Utc> {
+    let off = SERVER_CLOCK_OFFSET_MS.load(Ordering::Relaxed);
+    Utc::now() + chrono::Duration::milliseconds(off)
+}
+
+// ── R-18: device token refresh ───────────────────────────────────────────────
+/// Decode the JWT `exp` (seconds epoch) WITHOUT verifying the signature.
+fn jwt_exp_secs(token: &str) -> Option<i64> {
+    use base64::Engine;
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("exp").and_then(|v| v.as_i64())
+}
+
+/// R-18: refresh the device token when it's within 30 days of expiring, so a
+/// box in the field never silently dies at the 365-day mark.
+async fn maybe_refresh_token() {
+    let cfg = config::AppConfig::load();
+    let (id, token) = match (cfg.device_id.clone(), cfg.device_token.clone()) {
+        (Some(i), Some(t)) => (i, t),
+        _ => return,
+    };
+    let exp = match jwt_exp_secs(&token) {
+        Some(e) => e,
+        None => return,
+    };
+    let days_left = (exp - Utc::now().timestamp()) / 86400;
+    if days_left > 30 {
+        return;
+    }
+    log::info!("R-18: device token expires in {} days — refreshing", days_left);
+    match api::refresh_device_token(&id, &token).await {
+        Ok(new_token) => {
+            let _ = config::AppConfig::update_and_save(|c| {
+                c.device_token = Some(new_token.clone());
+            });
+            log::info!("R-18: device token refreshed (fresh 365d)");
+        }
+        Err(e) => log::error!("R-18: token refresh failed: {}", e),
+    }
+}
+
+// ── R-10: periodic re-sync to the server's now-playing ───────────────────────
+// Keeps branches of the same zone converged: if a player drifted onto a
+// DIFFERENT song than the server says is current, jump to the right one. We
+// never jump mid-song (only on wrong-song) and rate-limit to avoid churn, so a
+// correction is rare and only happens on real divergence.
+static LAST_RESYNC_MS: AtomicI64 = AtomicI64::new(0);
+const RESYNC_INTERVAL_SECS: u64 = 180;
+const RESYNC_MIN_GAP_MS: i64 = 300_000; // at most one correction per 5 min
+
+pub async fn start_resync_loop(handle: AppHandle) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(RESYNC_INTERVAL_SECS)).await;
+
+        let cfg = config::AppConfig::load();
+        let zone_id = match cfg.zone_id.clone() {
+            Some(z) if !z.is_empty() => z,
+            _ => continue,
+        };
+        let np = match api::fetch_zone_now_playing(&zone_id).await {
+            Ok(j) => j,
+            Err(_) => continue, // offline → leave local playback alone
+        };
+        if let Some(ts) = np.get("syncTimestamp").and_then(|v| v.as_i64()) {
+            update_clock_offset(ts);
+        }
+        let ct = match np.get("currentTrack") {
+            Some(c) => c,
+            None => continue,
+        };
+        if ct.get("isSpot").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let server_id = ct.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if server_id.is_empty() {
+            continue;
+        }
+        let seek = ct.get("seekPosition").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+
+        let mut p = match audio::player().lock() {
+            Ok(p) => p,
+            Err(e) => e.into_inner(),
+        };
+        if !p.is_playing() {
+            continue;
+        }
+        let local_id = p.current_track_id().unwrap_or_default();
+        if local_id == server_id {
+            continue; // aligned — nothing to do
+        }
+        // Drifted onto a different song. Rate-limit corrections.
+        let now_ms = Utc::now().timestamp_millis();
+        let last = LAST_RESYNC_MS.load(Ordering::Relaxed);
+        if now_ms - last < RESYNC_MIN_GAP_MS {
+            log::info!("R-10: drift (local={} server={}) but within rate-limit window, skipping", local_id, server_id);
+            continue;
+        }
+        if p.resync_to(server_id, seek) {
+            LAST_RESYNC_MS.store(now_ms, Ordering::Relaxed);
+            log::info!("R-10: re-aligned to server — track {} seek {:.0}s", server_id, seek);
+            if let Some(t) = p.current_track() {
+                let _ = handle.emit("now-playing", serde_json::json!({
+                    "title": t.title,
+                    "artist": t.artist,
+                    "duration": t.duration,
+                    "position": seek,
+                    "artworkUrl": t.artwork_url,
+                }));
+            }
+        }
+    }
+}
 
 // ── SonicBox anti-repeat (R-12) ─────────────────────────────────────────────
 // A voted track must NEVER loop back-to-back. It may play again, but only after
@@ -227,6 +365,9 @@ pub async fn start_sync_loop(handle: AppHandle) {
 
             // After sync, try to flush pending play reports
             flush_pending_reports(&device_id, &device_token).await;
+
+            // R-18: keep the device token from expiring at the 365-day mark.
+            maybe_refresh_token().await;
 
             // Run LRU cache cleanup
             db::cleanup_cache();
@@ -456,7 +597,9 @@ async fn do_sync(
     // Get timezone from sync response
     let tz_str = sync_data.get("timezone").and_then(|v| v.as_str()).unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
-    let now = chrono::Utc::now().with_timezone(&tz);
+    // R-11: server-corrected time so the shuffle seed (date) and schedule
+    // position match the server / other branches even if this clock is off.
+    let now = server_now().with_timezone(&tz);
 
     // Save timezone in config for offline use
     let tz_owned = tz_str.to_string();
@@ -628,6 +771,10 @@ async fn do_sync(
     let mut seek_secs = 0.0f32;
     let mut from_server = false;
     if let Ok(np) = api::fetch_zone_now_playing(&zone_id).await {
+        // R-11: sync our clock to the server.
+        if let Some(ts) = np.get("syncTimestamp").and_then(|v| v.as_i64()) {
+            update_clock_offset(ts);
+        }
         if let Some(ct) = np.get("currentTrack") {
             let is_spot = ct.get("isSpot").and_then(|v| v.as_bool()).unwrap_or(false);
             let cur_id = ct.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -792,7 +939,7 @@ async fn download_and_save_spots(spots: &[serde_json::Value]) {
 
 /// Check if a spot should play based on schedule rules
 fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Option<String> {
-    let now = Utc::now().with_timezone(tz);
+    let now = server_now().with_timezone(tz); // R-11: server-corrected time
     let day_of_week = now.weekday().num_days_from_monday();
     let current_time = now.format("%H:%M").to_string();
     let current_date = now.format("%Y-%m-%d").to_string();

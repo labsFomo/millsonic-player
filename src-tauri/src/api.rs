@@ -69,6 +69,24 @@ pub async fn send_telemetry(device_id: &str, device_token: &str, telemetry: &ser
     Ok(resp)
 }
 
+/// R-18: refresh the device token before it expires. Returns the new token.
+pub async fn refresh_device_token(
+    device_id: &str,
+    device_token: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client()
+        .post(format!("{}/devices/{}/refresh-token", API_BASE, device_id))
+        .json(&serde_json::json!({ "deviceToken": device_token }))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    resp.get("deviceToken")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "refresh-token: no deviceToken in response".into())
+}
+
 pub async fn ack_command(device_id: &str, device_token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = client()
         .post(format!("{}/devices/{}/command-ack", API_BASE, device_id))
