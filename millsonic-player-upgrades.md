@@ -365,6 +365,42 @@ R-17 (config con backup). Más: SonicBox Desktop CAMBIO 1-4, P0-2/3/7.
 
 ---
 
+### U8 — Update remoto (auto-update): cómo testearlo de verdad  ·  🟡 INFRA LISTA, FALTA TEST E2E
+**Qué hay (todo implementado):** `tauri-plugin-updater` con pubkey + endpoint
+`GET /devices/update/{target}/{arch}/{version}` (que devuelve `latest.json` o **204** si
+estás al día). El **CI** (`.github/workflows/build.yml`) en un **push de tag `vX.Y.Z`**:
+buildea + **firma** el AppImage (con `TAURI_SIGNING_PRIVATE_KEY` + password, secrets de
+GitHub) → crea release → genera `latest.json` → lo **scp'ea a la EC2**. Confirmado funcionando
+(el endpoint hoy devuelve 204 para 0.8.x porque `latest.json` apunta a 0.6.2).
+
+**Por qué NO se pudo testear local (3 bloqueos):**
+1. **AppImage no buildea headless en Labs** (linuxdeploy falla aún con `APPIMAGE_EXTRACT_AND_RUN=1`).
+2. **Key de firma con password** (`rsign encrypted`) — la pass es un secret de CI, no la tengo local.
+3. **El player se instaló por `.deb`** (en `/usr/bin`, root). El updater de Tauri reemplaza el
+   **ejecutable corriendo**: con **AppImage** (user-writable) anda; con `.deb` necesita root → no.
+
+**Cómo testearlo (único camino real = vía CI + AppImage):**
+1. Mergear/pushear el branch a `main` y **pushear un tag `v0.8.3`** → CI publica el AppImage 0.8.3
+   firmado + actualiza `latest.json`.
+2. **Instalar el player en la PC como AppImage** (descargado del release), no por `.deb`.
+3. Pushear `v0.8.4` → CI publica + actualiza `latest.json`.
+4. El player 0.8.3 (corriendo como AppImage) chequea el endpoint → ve 0.8.4 → **auto-update**. ✅
+> Para producción retail: **distribuir como AppImage** (no `.deb`) para que el auto-update
+> funcione. O, si se quiere `.deb`, hace falta otro mecanismo de update (con privilegios).
+
+---
+
+### R-15 — Backoff del vigía SonicBox en offline  ·  ✅ LISTO · P2
+Implementado en 0.8.3 (`sync.rs:start_sonicbox_loop`): contador de fallos consecutivos → sleep
+extra creciente (+3s por fallo hasta ~45s) cuando no hay red; resetea al volver online. Ya no
+pollea cada 3s a ciegas.
+
+### R-16 — Salto de track al cambiar de slot  ·  ✅ RESUELTO por U5
+Con U5 el arranque/cambio de slot usa el `currentTrack` del server (no hay recálculo de índice +
+advance que saltee). No requirió código nuevo.
+
+---
+
 ## Estado al 2026-05-30 (0.8.2, probado en la PC real)
 **Hechos y probados:** U1, U2, U4, U5, U6 ✅✅ · U7 ✅ LISTO · **R-10, R-11 ✅✅ PROBADO**
 (player 0.8.2) · **R-18 ✅✅ endpoint probado** (backend deployado; lógica player wired).

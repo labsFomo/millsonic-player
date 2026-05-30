@@ -1012,9 +1012,17 @@ pub async fn start_sonicbox_loop(_handle: AppHandle) {
 
     let mut last_full_fetch = Instant::now() - Duration::from_secs(60);
     let mut late_fetched_for: Option<String> = None;
+    // R-15: back off when offline so we don't hammer the network every 3s.
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         tokio::time::sleep(TICK).await;
+        // Extra backoff after repeated failures (offline): +3s per failure up to
+        // ~45s, on top of the base TICK. Resets on the first success.
+        if consecutive_failures > 0 {
+            let extra = (consecutive_failures.min(15) * 3) as u64;
+            tokio::time::sleep(Duration::from_secs(extra)).await;
+        }
 
         let cfg = config::AppConfig::load();
         let zone_id = match cfg.zone_id.clone() {
@@ -1052,9 +1060,15 @@ pub async fn start_sonicbox_loop(_handle: AppHandle) {
         last_full_fetch = Instant::now();
 
         let json = match api::fetch_zone_now_playing(&zone_id).await {
-            Ok(j) => j,
+            Ok(j) => {
+                consecutive_failures = 0; // R-15: back online
+                j
+            }
             Err(e) => {
-                log::warn!("SonicBox: now-playing fetch failed: {}", e);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures <= 3 {
+                    log::warn!("SonicBox: now-playing fetch failed ({}): {}", consecutive_failures, e);
+                }
                 continue;
             }
         };
