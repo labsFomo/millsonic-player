@@ -1,6 +1,6 @@
 [package]
 name = "millsonic-player"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 default-run = "millsonic-player"
 

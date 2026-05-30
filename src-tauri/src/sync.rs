@@ -1185,7 +1185,12 @@ pub fn check_track_advancement(handle: &AppHandle) {
 
     // Check crossfade trigger: if near end of track and crossfade enabled
     let cfg = config::AppConfig::load();
-    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot && !player.playing_sonicbox {
+    // R-13: also hold off crossfade when a SonicBox vote is STAGED to play next
+    // — otherwise crossfade would slide into the grid's next track and the voted
+    // track would be skipped. Letting the track finish naturally lets the
+    // SonicBox injection play the voted song.
+    if cfg.crossfade_enabled && !player.crossfade_active && !player.playing_spot
+        && !player.playing_sonicbox && !player.has_sonicbox_next() {
         // Clone track info to avoid borrow conflicts
         let track_info = player.current_track().cloned();
         let next_info = player.peek_next().cloned();
