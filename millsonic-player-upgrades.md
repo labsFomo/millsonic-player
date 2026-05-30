@@ -13,7 +13,7 @@
 > **Seguimiento:** cada update se marca **✅ LISTO** al implementarlo, y **✅✅ PROBADO**
 > recién cuando se verifica en hardware real. Así sabemos siempre qué está hecho vs validado.
 
-**Versión actual del player:** 0.7.0
+**Versión actual del player:** 0.8.1
 **Última actualización:** 2026-05-30
 
 ---
@@ -25,7 +25,12 @@ instalación, pairing, **audio sonando (confirmado por Pablo)**, UI, y **SonicBo
 completo** (voto → entra al terminar la canción → toca entero → `play-report` cierra el
 loop → grilla retoma sin loopear). En esa prueba salieron estos upgrades:
 
-### U1 — Descarga progresiva (no bajar toda la playlist antes de tocar)  ·  🔴 P1
+### U1 — Descarga progresiva (no bajar toda la playlist antes de tocar)  ·  ✅✅ PROBADO · P1
+**Implementado en 0.8.1** (`sync.rs:do_sync` — baja solo el track de arranque, reproduce,
+y baja el resto en background en orden adelante del playhead; fallback al primer cacheado si
+el de arranque no está, nunca silencio). **Probado en la PC real (2026-05-30):** arrancó a
+sonar de inmediato + `Background download of remaining tracks complete`. ✓
+
 **Qué pasa hoy:** al sincronizar, el player **descarga las 30 canciones completas de la
 playlist ANTES de reproducir la primera**. Muestra una pantalla "Descargando canciones
 (N/30)…" y recién cuando termina TODO, arranca el audio.
@@ -58,7 +63,12 @@ created` (debe ser segundos, no el total del lote).
 
 ---
 
-### U2 — Render de la WebView/UI en GPU Intel (blanco transitorio + "Conectando" lento)  ·  🔴 P1
+### U2 — Render de la WebView/UI en GPU Intel (blanco transitorio + "Conectando" lento)  ·  ✅✅ PROBADO · P1
+**Implementado en 0.8.1** (`main.rs` setea `WEBKIT_DISABLE_DMABUF_RENDERER=1` en Linux antes
+de crear la WebView). **Probado en la PC real (Intel GPU, 2026-05-30):** la UI renderiza
+limpia (carátula + título + controles), sin pantalla en blanco. ✓ (El delay de "Conectando…"
+queda como refinamiento menor de la transición de UI, ver U7/`main.js`.)
+
 **Qué pasa hoy:** en la PC de prueba (GPU Intel), al lanzar el player aparecen warnings de
 GPU en stderr:
 ```
@@ -99,7 +109,15 @@ queda en blanco y pasa a now-playing en pocos segundos. Probar en la GPU Intel r
 
 ---
 
-### U7 — Manejo y presentación de errores (nunca mostrar un error crudo en blanco)  ·  🔴 P1
+### U7 — Manejo y presentación de errores (nunca mostrar un error crudo en blanco)  ·  ✅ LISTO · P1
+**Implementado en 0.8.1** (`main.js`: error boundary global — `window.error` →
+`showFatalError()` con pantalla branded, código `E-UI-002`, botón Reintentar + auto-reload a
+los 15s; aclara "la música sigue sonando"; `unhandledrejection` solo loguea para no tapar la
+UI por hiccups transitorios). Deployado y la UI se ve sana (sin error crudo). **Falta PROBAR:**
+forzar un error real para ver la pantalla branded en vivo. **Pendiente (sub-ítem):** detección
+Rust-side de fallo de carga de la WebView (pantalla en blanco) con auto-restart — más robusto
+que solo el boundary JS.
+
 **Qué pasa hoy:** ante una falla, la WebView puede mostrar un **error crudo de browser sobre
 fondo blanco**, ej:
 ```
@@ -196,7 +214,13 @@ sin reiniciar.
 
 ---
 
-### U5 — Arrancar en la canción y SEGUNDO correctos (usar el now-playing del server, como el web)  ·  🔴 P1
+### U5 — Arrancar en la canción y SEGUNDO correctos (usar el now-playing del server, como el web)  ·  ✅✅ PROBADO · P1
+**Implementado en 0.8.1** (`sync.rs:do_sync` usa `currentTrack.id` + `seekPosition` del
+now-playing del server; fallback time-based local offline. Nuevo `audio::play_file_at(seek)`
+que saltea al segundo correcto). **Probado en la PC real (2026-05-30):** `Start from server
+now-playing: track 17 of 30, seek 181s` → reprodujo desde el segundo 181, alineado con el web
+player. Se acabó el "siempre la misma canción desde 0". ✓
+
 **Qué pasa hoy:** al sincronizar (online), el player calcula **localmente** qué track toca
 por horario (`elapsed % duración_total`) y reproduce ese track **desde el segundo 0**. Dos
 problemas:
@@ -341,15 +365,16 @@ R-17 (config con backup). Más: SonicBox Desktop CAMBIO 1-4, P0-2/3/7.
 
 ---
 
-## Próxima tanda sugerida
-1. **U4 (instancia única)** — chico y de alto impacto; evita audio superpuesto y doble-launch.
-2. **U5 (arrancar en canción + segundo correctos)** — alinea con el web player; arregla el
-   "siempre arranca la misma canción desde 0".
-3. **U6 (cambios de canciones en playlist se apliquen sin reiniciar)** — propaga edits de
-   contenido en ~60s, no al próximo slot/reinicio.
-3b. **U7 (manejo de errores branded)** — nunca un error crudo en blanco; reintento /
-   auto-restart / pantalla branded con código + soporte. Retail-critical.
-4. **U1 (descarga progresiva)** — el que más mueve la aguja para "música ASAP".
-5. **U2 (render WebView)** — para que la pantalla nunca se vea rota en GPUs Intel.
-6. **R-10/R-11/R-18** (backend) — sincronía multi-sucursal + token, cuando ataquemos backend.
-7. P2 client-side (R-05/08/13/15/16) cuando haya espacio.
+## Estado al 2026-05-30 (0.8.1, probado en la PC real)
+**Hechos y probados:** U1, U4, U5, U6, U2 ✅✅ · U7 ✅ LISTO (falta forzar un error para verlo).
+Todos los **P0** del santo grial + estos U1-U7 cerrados.
+
+## Próxima tanda sugerida (lo que queda)
+1. **U7 sub-ítem** — forzar un error para validar la pantalla branded en vivo + detección
+   Rust-side de WebView en blanco con auto-restart.
+2. **R-10 / R-11 / R-18** (backend) — sincronía multi-sucursal (re-sync periódico contra
+   `syncTimestamp`) + reloj/NTP + refresh del token de device.
+3. **P2 client-side** — R-05 (no-repeat grilla), R-08 (prioridad audio), R-13 (crossfade+SB),
+   R-15 (backoff vigía offline), R-16 (salto al cambiar slot).
+4. **Refinamiento U2** — el delay de "Conectando…": mostrar now-playing apenas hay evento,
+   no esperar el de conexión.
