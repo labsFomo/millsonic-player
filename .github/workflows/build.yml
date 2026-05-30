@@ -24,6 +24,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # macOS signing/notarization is flaky and shouldn't block the Linux/Windows
+    # release (the updater + retail boxes are Linux). Let macOS fail soft.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
 
     steps:
       - uses: actions/checkout@v4
