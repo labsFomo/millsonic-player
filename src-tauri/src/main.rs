@@ -306,6 +306,19 @@ fn main() {
     setup_logging();
 
     tauri::Builder::default()
+        // U4: single-instance MUST be registered first. If a second copy is
+        // launched in the same session, this callback runs in the EXISTING
+        // instance (the new process exits immediately) — we just raise/focus
+        // the existing window instead of starting a second player (which would
+        // overlap audio and duplicate resources).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::warn!("Second instance launch ignored — focusing existing window");
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![]),
