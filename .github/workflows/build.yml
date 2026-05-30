@@ -131,7 +131,9 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # always() so a soft macOS failure (signing/notarization) doesn't skip the
+    # release — the Linux/Windows artifacts (what retail boxes use) still publish.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
     steps:
       - uses: actions/checkout@v4
 
