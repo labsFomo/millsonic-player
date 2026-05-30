@@ -365,15 +365,23 @@ R-17 (config con backup). Más: SonicBox Desktop CAMBIO 1-4, P0-2/3/7.
 
 ---
 
-## Estado al 2026-05-30 (0.8.1, probado en la PC real)
-**Hechos y probados:** U1, U4, U5, U6, U2 ✅✅ · U7 ✅ LISTO (falta forzar un error para verlo).
-Todos los **P0** del santo grial + estos U1-U7 cerrados.
+## Estado al 2026-05-30 (0.8.2, probado en la PC real)
+**Hechos y probados:** U1, U2, U4, U5, U6 ✅✅ · U7 ✅ LISTO · **R-10, R-11 ✅✅ PROBADO**
+(player 0.8.2) · **R-18 ✅✅ endpoint probado** (backend deployado; lógica player wired).
+Todos los **P0** + U1-U7 + R-10/11/18 cerrados.
+- **R-11:** offset de reloj del server (`syncTimestamp`) usado en seed del shuffle + spots.
+- **R-10:** re-sync cada 180s, re-alinea solo si quedó en canción equivocada (rate-limit 5min).
+  Probado en la PC: 0 re-aligns espurios, playback fluido.
+- **R-18:** `POST /devices/:id/refresh-token` (backend, deployado) + player refresca con <30
+  días. Endpoint probado por curl (token nuevo 365d que autentica).
+  ⚠️ Backend R-18 **deployado a prod pero sin commitear** (junto al resto del working tree).
 
 ## Próxima tanda sugerida (lo que queda)
 1. **U7 sub-ítem** — forzar un error para validar la pantalla branded en vivo + detección
    Rust-side de WebView en blanco con auto-restart.
-2. **R-10 / R-11 / R-18** (backend) — sincronía multi-sucursal (re-sync periódico contra
-   `syncTimestamp`) + reloj/NTP + refresh del token de device.
+2. **R-10 refinamiento** — adoptar el timeline del server (spots por offset) para sync al
+   segundo perfecto entre sucursales (hoy alinea a nivel canción, no segundo, durante la
+   reproducción larga).
 3. **P2 client-side** — R-05 (no-repeat grilla), R-08 (prioridad audio), R-13 (crossfade+SB),
    R-15 (backoff vigía offline), R-16 (salto al cambiar slot).
 4. **Refinamiento U2** — el delay de "Conectando…": mostrar now-playing apenas hay evento,
