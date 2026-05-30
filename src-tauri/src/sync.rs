@@ -585,71 +585,64 @@ async fn do_sync(
         log::info!("Same playlist id but TRACK LIST CHANGED — reloading playlist (U6)");
     }
 
-    // Different playlist or first sync — download and start playing
+    // Different playlist (first sync / new slot / U6 content change) — (re)build
+    // the playlist and start playing. U1: download only the start track first,
+    // play it, then download the rest in the background.
     let cache_dir = config::AppConfig::cache_dir();
     std::fs::create_dir_all(&cache_dir)?;
 
     let total_tracks = current_tracks.len();
-    let mut playlist: Vec<audio::TrackInfo> = Vec::new();
     let mut first_track_started = false;
 
-    let _ = handle.emit("sync-progress", serde_json::json!({
-        "phase": "downloading",
-        "current": 0,
-        "total": total_tracks,
-        "trackName": "",
-        "percent": 0
-    }));
-
-    for (i, track_val) in current_tracks.iter().enumerate() {
-        let track_id = track_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let title = track_val.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown");
-        let artist = track_val.get("artist").and_then(|v| v.as_str()).unwrap_or("Unknown");
+    // Build the full playlist metadata up front. file_path is the predetermined
+    // cache location even if the file isn't downloaded yet (progressive).
+    let mut playlist: Vec<audio::TrackInfo> = Vec::new();
+    let mut dl_info: Vec<(String, String, std::path::PathBuf)> = Vec::new(); // (id, stream_url, path)
+    for track_val in current_tracks.iter() {
+        let track_id = track_val.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let title = track_val.get("title").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+        let artist = track_val.get("artist").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
         let duration = track_val.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
         let artwork_url = track_val.get("artworkUrl").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let stream_url = track_val.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("");
-
+        let stream_url = track_val.get("streamUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let file_path = cache_dir.join(format!("{}.mp3", track_id));
+        db::upsert_track(&track_id, &title, &artist, artwork_url.as_deref(), duration, &file_path.to_string_lossy());
+        dl_info.push((track_id.clone(), stream_url, file_path.clone()));
+        playlist.push(audio::TrackInfo {
+            track_id,
+            title,
+            artist,
+            file_path: file_path.to_string_lossy().to_string(),
+            duration,
+            artwork_url,
+        });
+    }
+    if playlist.is_empty() {
+        return Ok(());
+    }
 
-        let percent = ((i as f64 / total_tracks as f64) * 100.0) as u32;
-        let _ = handle.emit("sync-progress", serde_json::json!({
-            "phase": "downloading",
-            "current": i + 1,
-            "total": total_tracks,
-            "trackName": title,
-            "percent": percent
-        }));
-
-        if !file_path.exists() && !stream_url.is_empty() {
-            log::info!("Downloading track: {} - {}", track_id, title);
-            match api::download_track(stream_url, &file_path).await {
-                Ok(_) => log::info!("Downloaded: {}", title),
-                Err(e) => {
-                    log::error!("Failed to download {}: {}", title, e);
-                    continue;
+    // ── U5: decide WHERE to start — which track AND which second. Authoritative
+    // source = server now-playing (currentTrack.id + seekPosition), exactly like
+    // the web player. Offline / on failure, fall back to a local time-based calc.
+    let mut start_index = 0usize;
+    let mut seek_secs = 0.0f32;
+    let mut from_server = false;
+    if let Ok(np) = api::fetch_zone_now_playing(&zone_id).await {
+        if let Some(ct) = np.get("currentTrack") {
+            let is_spot = ct.get("isSpot").and_then(|v| v.as_bool()).unwrap_or(false);
+            let cur_id = ct.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_spot && !cur_id.is_empty() {
+                if let Some(idx) = playlist.iter().position(|t| t.track_id == cur_id) {
+                    start_index = idx;
+                    seek_secs = ct.get("seekPosition").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                    from_server = true;
+                    log::info!("Start from server now-playing: track {} of {}, seek {:.0}s (U5)",
+                        idx, playlist.len(), seek_secs);
                 }
             }
         }
-
-        if file_path.exists() {
-            let fp_str = file_path.to_string_lossy().to_string();
-            // Save track to SQLite
-            db::upsert_track(track_id, title, artist, artwork_url.as_deref(), duration, &fp_str);
-
-            playlist.push(audio::TrackInfo {
-                track_id: track_id.to_string(),
-                title: title.to_string(),
-                artist: artist.to_string(),
-                file_path: fp_str,
-                duration,
-                artwork_url,
-            });
-        }
     }
-
-    if !playlist.is_empty() {
-        log::info!("All downloads complete, updating playlist with {} tracks", playlist.len());
-
+    if !from_server {
         let start_t = slot_start_time.as_deref().unwrap_or("00:00");
         let parts: Vec<&str> = start_t.split(':').collect();
         let start_h: u32 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -657,41 +650,74 @@ async fn do_sync(
         let slot_start_secs = (start_h * 3600 + start_m * 60) as f64;
         let now_secs = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f64;
         let elapsed_secs = if now_secs >= slot_start_secs { now_secs - slot_start_secs } else { 0.0 };
-
-        let mut total_duration: f64 = 0.0;
-        for t in &playlist {
-            total_duration += t.duration as f64;
-        }
-
-        let start_index = if total_duration > 0.0 {
-            let looped_elapsed = elapsed_secs % total_duration;
-            let mut accumulated = 0.0;
-            let mut idx = 0;
+        let total_duration: f64 = playlist.iter().map(|t| t.duration as f64).sum();
+        if total_duration > 0.0 {
+            let looped = elapsed_secs % total_duration;
+            let mut acc = 0.0f64;
             for (i, t) in playlist.iter().enumerate() {
-                accumulated += t.duration as f64;
-                if accumulated > looped_elapsed {
-                    idx = i;
+                let next = acc + t.duration as f64;
+                if next > looped {
+                    start_index = i;
+                    seek_secs = (looped - acc) as f32;
                     break;
                 }
+                acc = next;
             }
-            log::info!("Schedule position: elapsed={:.0}s, total_duration={:.0}s, starting at track {} of {}",
-                elapsed_secs, total_duration, idx, playlist.len());
-            idx
-        } else {
-            0
-        };
+        }
+        log::info!("Start from local fallback: track {} of {}, seek {:.0}s", start_index, playlist.len(), seek_secs);
+    }
 
+    // ── U1: download ONLY the start track, begin playing, then background the
+    // rest. If the start track can't be cached, fall back to the first cached
+    // one so we NEVER block into silence.
+    {
+        let start = &dl_info[start_index];
+        if !start.2.exists() && !start.1.is_empty() {
+            log::info!("Downloading start track first (progressive): {}", playlist[start_index].title);
+            if let Err(e) = api::download_track(&start.1, &start.2).await {
+                log::error!("Start track download failed: {}", e);
+            }
+        }
+    }
+    if !dl_info[start_index].2.exists() {
+        if let Some(idx) = dl_info.iter().position(|d| d.2.exists()) {
+            log::warn!("Start track not cached — falling back to first cached track");
+            start_index = idx;
+            seek_secs = 0.0;
+        }
+    }
+
+    {
         let mut player = audio::player().lock().map_err(|e| e.to_string())?;
         player.set_playlist(playlist);
         player.current_index = start_index;
-        if let Err(e) = player.play_current() {
+        if let Err(e) = player.play_current_at(seek_secs) {
             log::error!("Failed to start playback: {}", e);
         } else {
             first_track_started = true;
         }
-        *current_playlist_id().lock().unwrap() = playlist_id;
-        *current_tracks_fp().lock().unwrap() = Some(new_fp.clone());
-        let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
+    }
+    *current_playlist_id().lock().unwrap() = playlist_id;
+    *current_tracks_fp().lock().unwrap() = Some(new_fp.clone());
+    let _ = handle.emit("status-change", serde_json::json!({"playing": true}));
+
+    // Background-download the remaining tracks in playhead order (next, then the
+    // one after, wrapping around) so each is ready before it's needed (U1).
+    {
+        let n = dl_info.len();
+        let order: Vec<(String, String, std::path::PathBuf)> =
+            (1..n).map(|k| dl_info[(start_index + k) % n].clone()).collect();
+        tauri::async_runtime::spawn(async move {
+            for (id, url, path) in order {
+                if path.exists() || url.is_empty() {
+                    continue;
+                }
+                if let Err(e) = api::download_track(&url, &path).await {
+                    log::error!("Background download failed for {}: {}", id, e);
+                }
+            }
+            log::info!("Background download of remaining tracks complete");
+        });
     }
 
     if first_track_started {

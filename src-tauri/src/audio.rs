@@ -140,13 +140,23 @@ impl AudioPlayer {
     }
 
     pub fn play_file(&mut self, track: &TrackInfo) -> Result<(), String> {
-        log::info!("play_file: '{}' at {}", track.title, track.file_path);
+        self.play_file_at(track, 0.0)
+    }
+
+    /// Play a track, optionally seeking `seek_secs` into it (U5 — start at the
+    /// exact second the schedule timeline dictates, matching the web player).
+    /// The seek is done by decoding-and-discarding the head (one-time cost,
+    /// reliable for mp3 regardless of decoder seek support).
+    pub fn play_file_at(&mut self, track: &TrackInfo, seek_secs: f32) -> Result<(), String> {
+        use rodio::Source;
+        let seek = seek_secs.max(0.0);
+        log::info!("play_file: '{}' at {} (seek={:.0}s)", track.title, track.file_path, seek);
 
         if !self.audio_available {
             log::warn!("Audio not available, simulating playback of: {}", track.title);
             self.is_playing = true;
             self.play_started_at = Some(Instant::now());
-            self.pause_elapsed = 0.0;
+            self.pause_elapsed = seek;
             return Ok(());
         }
 
@@ -176,8 +186,15 @@ impl AudioPlayer {
             match rodio::Sink::try_new(handle) {
                 Ok(new_sink) => {
                     new_sink.set_volume(self.volume);
-                    new_sink.append(source);
-                    log::info!("Sink created and source appended, playing");
+                    // Only seek when meaningfully into the track (>0.5s) and not
+                    // past its end, to avoid wasted work / overshoot.
+                    if seek > 0.5 && (track.duration <= 0.0 || seek < track.duration - 1.0) {
+                        new_sink.append(source.skip_duration(std::time::Duration::from_secs_f32(seek)));
+                        log::info!("Sink created with seek to {:.0}s, playing", seek);
+                    } else {
+                        new_sink.append(source);
+                        log::info!("Sink created and source appended, playing");
+                    }
                     self.sink = Some(new_sink);
                 }
                 Err(e) => return Err(format!("Cannot create sink: {}", e)),
@@ -188,7 +205,7 @@ impl AudioPlayer {
 
         self.is_playing = true;
         self.play_started_at = Some(Instant::now());
-        self.pause_elapsed = 0.0;
+        self.pause_elapsed = seek;
         Ok(())
     }
 
@@ -422,6 +439,15 @@ impl AudioPlayer {
     pub fn play_current(&mut self) -> Result<(), String> {
         if let Some(track) = self.playlist.get(self.current_index).cloned() {
             self.play_file(&track)
+        } else {
+            Err("No track at current index".into())
+        }
+    }
+
+    /// Play the current track seeking `seek_secs` in (U5, used at startup).
+    pub fn play_current_at(&mut self, seek_secs: f32) -> Result<(), String> {
+        if let Some(track) = self.playlist.get(self.current_index).cloned() {
+            self.play_file_at(&track, seek_secs)
         } else {
             Err("No track at current index".into())
         }

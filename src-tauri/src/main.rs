@@ -303,6 +303,16 @@ fn setup_logging() {
 }
 
 fn main() {
+    // U2: on Linux, some GPUs (notably Intel with the zink/dmabuf path) render
+    // the WebView blank or flicker. Force WebKitGTK off the broken dmabuf
+    // renderer before the webview is created — a safe, widely-used fix.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     setup_logging();
 
     tauri::Builder::default()

@@ -8,6 +8,45 @@ function getListen() {
   return window.__TAURI__?.event?.listen;
 }
 
+// U7: never show a raw browser error. On an uncaught UI error, render a branded
+// screen with an error code + retry, and reassure that the MUSIC keeps playing
+// (audio runs in the Rust core, independent of this WebView).
+function showFatalError(code, detail) {
+  try { console.error('[millsonic] fatal', code, detail); } catch (_) {}
+  let el = document.getElementById('ms-fatal-error');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'ms-fatal-error';
+    el.style.cssText =
+      'position:fixed;inset:0;z-index:99999;background:#0B1220;color:#E2E8F0;' +
+      'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+      'text-align:center;font-family:system-ui,-apple-system,sans-serif;padding:24px;';
+    document.body.appendChild(el);
+  }
+  el.innerHTML =
+    '<img src="assets/logo.svg" alt="Millsonic" style="width:88px;opacity:.9;margin-bottom:16px"/>' +
+    '<h2 style="margin:0 0 8px;font-weight:600">Tuvimos un problema en la pantalla</h2>' +
+    '<p style="margin:0;color:#94A3B8">La música sigue sonando. Vamos a reintentar solos.</p>' +
+    '<p style="margin:10px 0;color:#64748B;font-size:12px">Código: <b>' + code + '</b> — si persiste, contactá a soporte.</p>' +
+    '<button id="ms-fatal-retry" style="margin-top:12px;background:#2563EB;border:none;color:#fff;' +
+    'padding:10px 22px;border-radius:8px;cursor:pointer;font-size:14px">Reintentar</button>';
+  const btn = document.getElementById('ms-fatal-retry');
+  if (btn) btn.onclick = () => location.reload();
+  // Auto-retry once after 15s in case nobody is at the venue.
+  if (!window.__ms_fatal_retry_armed) {
+    window.__ms_fatal_retry_armed = true;
+    setTimeout(() => location.reload(), 15000);
+  }
+}
+
+window.addEventListener('error', (e) => {
+  showFatalError('E-UI-002', String((e && (e.message || e.error)) || 'unknown'));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  // Transient backend hiccups reject promises — log only, don't cover the UI.
+  try { console.error('[millsonic] unhandledrejection', e && e.reason); } catch (_) {}
+});
+
 // --- Pairing ---
 async function pairDevice() {
   const invoke = getInvoke();
