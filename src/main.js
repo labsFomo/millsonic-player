@@ -321,6 +321,14 @@ async function setupListeners() {
     const data = event.payload;
     if (data) setDebugMode(!!data.enabled);
   });
+
+  await listen('show-stats', async () => {
+    const panel = document.getElementById('stats-panel');
+    if (panel) {
+      panel.classList.remove('hidden');
+      await refreshStats();
+    }
+  });
 }
 
 // --- Zone Display ---

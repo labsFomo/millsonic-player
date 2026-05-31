@@ -135,6 +135,49 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
 
 fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle) {
     log::info!("Executing remote command: {}", cmd);
+    let cmd_lower = cmd.to_lowercase();
+
+    // ── Commands that do NOT need the audio lock ──
+    // Handled first so they never get dropped while a crossfade holds the lock.
+    match cmd_lower.as_str() {
+        "forcesync" | "force_sync" | "sync" => {
+            crate::sync::trigger_sync();
+            return;
+        }
+        "show_stats" | "showstats" | "stats" => {
+            log::info!("Show stats requested");
+            let _ = handle.emit("show-stats", serde_json::json!({}));
+            return;
+        }
+        "set_debug" | "setdebug" | "debug" => {
+            let enabled = resp.get("value")
+                .or_else(|| resp.get("commandValue"))
+                .or_else(|| resp.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            log::info!("Debug mode set to: {} (via telemetry command)", enabled);
+            let _ = config::AppConfig::update_and_save(|cfg| { cfg.debug_mode = enabled; });
+            let _ = handle.emit("debug-mode", serde_json::json!({ "enabled": enabled }));
+            return;
+        }
+        "update" => {
+            log::info!("Update command received, triggering install");
+            let h = handle.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::updater::install_update(h).await {
+                    log::error!("Remote update failed: {}", e);
+                }
+            });
+            return;
+        }
+        "restart" => {
+            log::info!("Restart command received, restarting app");
+            handle.restart();
+        }
+        _ => {}
+    }
+
+    // ── Audio commands (need the player lock) ──
     let mut player = match audio::player().try_lock() {
         Ok(p) => p,
         Err(_) => {
@@ -142,8 +185,6 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
             return;
         }
     };
-
-    let cmd_lower = cmd.to_lowercase();
     match cmd_lower.as_str() {
         "play" => {
             log::info!("Resuming playback");
@@ -155,7 +196,7 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
             player.pause();
             let _ = handle.emit("playback-state", serde_json::json!({ "state": "paused" }));
         }
-        "setvolume" | "volume" => {
+        "setvolume" | "volume" | "set_volume" => {
             if let Some(val) = resp.get("value").or_else(|| resp.get("commandValue")).and_then(|v| v.as_u64()) {
                 log::info!("Setting volume to {}%", val);
                 player.set_volume(val as u8);
@@ -166,21 +207,6 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
         }
         "skiptrack" | "next" | "skip" => {
             let _ = player.skip_track();
-        }
-        "forcesync" | "force_sync" => {
-            crate::sync::trigger_sync();
-        }
-        "set_debug" | "setdebug" | "debug" => {
-            let enabled = resp.get("value")
-                .or_else(|| resp.get("commandValue"))
-                .or_else(|| resp.get("enabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            log::info!("Debug mode set to: {} (via telemetry command)", enabled);
-            drop(player);
-            let _ = config::AppConfig::update_and_save(|cfg| { cfg.debug_mode = enabled; });
-            let _ = handle.emit("debug-mode", serde_json::json!({ "enabled": enabled }));
-            return;
         }
         _ => log::warn!("Unknown command: {}", cmd),
     }
