@@ -34,6 +34,11 @@ fn server_now() -> chrono::DateTime<Utc> {
     Utc::now() + chrono::Duration::milliseconds(off)
 }
 
+/// R-11: last known server clock offset (ms). Positive = local clock is behind server.
+pub fn clock_offset_ms() -> i64 {
+    SERVER_CLOCK_OFFSET_MS.load(Ordering::Relaxed)
+}
+
 // ── R-18: device token refresh ───────────────────────────────────────────────
 /// Decode the JWT `exp` (seconds epoch) WITHOUT verifying the signature.
 fn jwt_exp_secs(token: &str) -> Option<i64> {
@@ -511,9 +516,11 @@ fn handle_offline_fallback(handle: &AppHandle, cfg: &config::AppConfig) {
     // Try to load cached schedule
     let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
-    let now = Utc::now().with_timezone(&tz);
-    // API uses luxon: 0=Mon..6=Sun. chrono: num_days_from_monday() gives 0=Mon..6=Sun
-    let day_of_week = now.weekday().num_days_from_monday();
+    // R-11: server-corrected time so day/slot match the server even if this clock is off.
+    let now = server_now().with_timezone(&tz);
+    // Source of truth: backend uses JS getDay() = 0=Sun..6=Sat.
+    // chrono num_days_from_sunday() gives 0=Sun..6=Sat — matches.
+    let day_of_week = now.weekday().num_days_from_sunday();
 
     let cached_slots = db::load_schedule(zone_id, day_of_week);
     let current_time = now.format("%H:%M").to_string();
@@ -719,11 +726,15 @@ async fn do_sync(
     let zone_id = config::AppConfig::load().zone_id.clone().unwrap_or_default();
     db::save_schedule(&zone_id, &slots);
 
-    // API uses luxon: 0=Mon..6=Sun. chrono: num_days_from_monday() gives 0=Mon..6=Sun
-    let day_of_week = now.weekday().num_days_from_monday();
+    // Source of truth: backend uses JS getDay() = 0=Sun..6=Sat.
+    // chrono num_days_from_sunday() gives 0=Sun..6=Sat — matches.
+    let day_of_week = now.weekday().num_days_from_sunday();
     let current_time = now.format("%H:%M").to_string();
 
-    log::info!("Looking for schedule: dayOfWeek={}, time={}", day_of_week, current_time);
+    log::info!(
+        "Looking for schedule: dayOfWeek={} time={} tz={} clock_offset_ms={}",
+        day_of_week, current_time, tz, clock_offset_ms()
+    );
 
     let mut current_tracks: Vec<serde_json::Value> = Vec::new();
     let mut playlist_id: Option<String> = None;
@@ -1009,7 +1020,8 @@ async fn download_and_save_spots(spots: &[serde_json::Value]) {
 /// Check if a spot should play based on schedule rules
 fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Option<String> {
     let now = server_now().with_timezone(tz); // R-11: server-corrected time
-    let day_of_week = now.weekday().num_days_from_monday();
+    // Source of truth: backend uses JS getDay() = 0=Sun..6=Sat.
+    let day_of_week = now.weekday().num_days_from_sunday();
     let current_time = now.format("%H:%M").to_string();
     let current_date = now.format("%Y-%m-%d").to_string();
 
