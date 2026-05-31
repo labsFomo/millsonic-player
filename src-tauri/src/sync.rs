@@ -1250,16 +1250,24 @@ pub fn check_track_advancement(handle: &AppHandle) {
                         }
                     }
                 } else if player.has_sonicbox_next() {
-                    // ── B: grid track ending + vote staged → crossfade INTO the
-                    //       voted track (no skip, no hard cut).
+                    // ── B: grid track ending + vote staged → play the voted track.
+                    //       NOTE: we use play_file() (a hard sink swap), NOT
+                    //       start_crossfade(). On real hardware the crossfade is
+                    //       fine, but it was leaving the voted track INAUDIBLE on
+                    //       some setups — the second rodio sink never took over the
+                    //       output, so the grid track kept sounding while the state
+                    //       said "SonicBox playing". play_file() replaces the single
+                    //       sink outright (the same path R-10 re-sync uses, which is
+                    //       reliably audible), so the vote the customer paid for
+                    //       actually plays. Small hard cut INTO the vote is the price.
                     if let Some((sb, vote)) = player.take_sonicbox_next() {
-                        if let Err(e) = player.start_crossfade(&sb) {
-                            log::error!("Crossfade (grid->sb) failed: {}", e);
+                        if let Err(e) = player.play_file(&sb) {
+                            log::error!("Play (grid->sb) failed: {}", e);
                             player.set_sonicbox_next(sb, vote); // put it back for the finish path
                         } else {
                             db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
                             db::touch_track(&cur.track_id);
-                            log::info!("Crossfade grid '{}' -> SonicBox '{}' (vote={})", cur.title, sb.title, vote);
+                            log::info!("Play grid '{}' -> SonicBox '{}' (vote={})", cur.title, sb.title, vote);
                             sb_note_played(&sb.track_id);
                             let sb_clone = sb.clone();
                             player.set_playing_sonicbox(sb_clone, vote);
