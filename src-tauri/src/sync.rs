@@ -1357,6 +1357,41 @@ pub fn check_track_advancement(handle: &AppHandle) {
                     }
                 } else {
                     // ── A: normal grid → grid.
+                    // Spots fire on THIS path too. Previously the crossfade path
+                    // skipped find_eligible_spot entirely, so on any zone with
+                    // crossfade enabled (the retail default) announcements NEVER
+                    // played — find_eligible_spot only ran in the no-crossfade
+                    // finish fallback. If a spot is due, interrupt with it before
+                    // crossfading; the spot-finished resume (above) then advances
+                    // to the next grid track (we DON'T advance here, matching the
+                    // finish path, so we don't skip a track).
+                    {
+                        let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
+                        let tz: chrono_tz::Tz =
+                            tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
+                        // cur is at its crossfade point (effectively the latest
+                        // finished track) → count it for spot frequency.
+                        if let Some(spot_path) =
+                            find_eligible_spot(&tz, player.tracks_since_last_spot + 1)
+                        {
+                            log::info!(
+                                "Playing spot before next track (crossfade path, tracks since last: {})",
+                                player.tracks_since_last_spot + 1
+                            );
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::touch_track(&cur.track_id);
+                            match player.play_spot_file(&spot_path) {
+                                Ok(_) => {
+                                    let _ = handle.emit("now-playing", serde_json::json!({
+                                        "title": "📢 Spot", "artist": "Anuncio",
+                                        "duration": 0, "position": 0.0, "artworkUrl": null,
+                                    }));
+                                    return;
+                                }
+                                Err(e) => log::error!("Failed to play spot (crossfade path): {}", e),
+                            }
+                        }
+                    }
                     if let Some(next) = player.peek_next().cloned() {
                         if let Err(e) = player.start_crossfade(&next) {
                             log::error!("Crossfade failed: {}", e);
