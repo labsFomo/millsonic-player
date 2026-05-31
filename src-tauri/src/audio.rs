@@ -511,6 +511,12 @@ impl AudioPlayer {
     }
 
     pub fn skip_track(&mut self) -> Result<(), String> {
+        // If a SonicBox vote is on air, clear its state before advancing to the
+        // grid — otherwise the flag stays dirty and keeps reporting a phantom
+        // vote after the skip.
+        if self.playing_sonicbox {
+            self.clear_playing_sonicbox();
+        }
         self.advance();
         self.play_current()
     }

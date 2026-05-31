@@ -148,13 +148,22 @@ fn get_now_playing() -> serde_json::Value {
         Err(_) => return serde_json::json!(null),
     };
 
-    match player.current_track() {
+    // When a SonicBox vote is on air it lives in sonicbox_current, NOT the grid
+    // slot current_track() returns — pick the right source so this command
+    // matches the every-1s now-playing emit instead of reporting the grid track.
+    let np = if player.playing_sonicbox {
+        player.sonicbox_current()
+    } else {
+        player.current_track()
+    };
+    match np {
         Some(track) => serde_json::json!({
             "title": track.title,
             "artist": track.artist,
             "duration": track.duration,
             "position": player.get_position(),
             "artworkUrl": track.artwork_url,
+            "isSonicBox": player.playing_sonicbox,
         }),
         None => serde_json::json!(null),
     }
@@ -429,13 +438,26 @@ fn main() {
                             WATCHDOG_LAST_POSITION.store((pos * 100.0) as u64, Ordering::Relaxed);
 
                             if player.is_playing() {
-                                if let Some(track) = player.current_track() {
+                                // When a SonicBox vote is on air it lives in
+                                // sonicbox_current, NOT the grid playlist slot that
+                                // current_track() returns. Emitting current_track()
+                                // every second overwrote the vote's title/artist/
+                                // artwork/duration in the UI with the grid track —
+                                // so the screen kept showing "the other song" while
+                                // the vote actually played. Pick the right source.
+                                let np = if player.playing_sonicbox {
+                                    player.sonicbox_current()
+                                } else {
+                                    player.current_track()
+                                };
+                                if let Some(track) = np {
                                     let _ = handle_ref.emit("now-playing", serde_json::json!({
                                         "title": track.title,
                                         "artist": track.artist,
                                         "duration": track.duration,
                                         "position": pos,
                                         "artworkUrl": track.artwork_url,
+                                        "isSonicBox": player.playing_sonicbox,
                                     }));
                                 }
                             }
@@ -484,6 +506,13 @@ fn main() {
                             // Stuck for ~30s (2 checks × 15s), force restart playback
                             log::error!("WATCHDOG: Audio stuck for ~30s at position {}cs, force-restarting!", current_pos);
                             if let Ok(mut player) = audio::player().lock() {
+                                // If a SonicBox vote was on air, clear its state
+                                // before recovering to the grid — otherwise the
+                                // flag stays dirty and keeps reporting a phantom
+                                // vote after the watchdog advances.
+                                if player.playing_sonicbox {
+                                    player.clear_playing_sonicbox();
+                                }
                                 // Force stop current playback
                                 player.stop();
                                 // Advance to next track

@@ -1308,9 +1308,16 @@ pub fn check_track_advancement(handle: &AppHandle) {
         if player.get_position() > 5.0 {
             player.consecutive_skips = 0;
         }
-        // Log position every 30s, and every second in the last 10s of track
+        // Log position every 30s, and every second in the last 10s of track.
+        // When a SonicBox vote is on air its real duration lives in
+        // sonicbox_current, NOT the grid slot current_track() returns — using the
+        // grid duration produced misleading logs like "Playing 280s / 227s".
         let pos = player.get_position();
-        let dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
+        let dur = if player.playing_sonicbox {
+            player.sonicbox_current().map(|t| t.duration).unwrap_or(0.0)
+        } else {
+            player.current_track().map(|t| t.duration).unwrap_or(0.0)
+        };
         let near_end = dur > 1.0 && pos >= dur - 10.0;
         if pos > 0.0 && ((pos as u32) % 30 == 0 || near_end) {
             log::info!("Playing {:.0}s / {:.0}s (finished={})", pos, dur, player.is_finished());
@@ -1319,8 +1326,16 @@ pub fn check_track_advancement(handle: &AppHandle) {
     }
 
     let position = player.get_position();
-    let track_title = player.current_track().map(|t| t.title.clone()).unwrap_or_default();
-    let track_dur = player.current_track().map(|t| t.duration).unwrap_or(0.0);
+    // Same as above: report the SonicBox vote's title/duration when it's on air.
+    let (track_title, track_dur) = if player.playing_sonicbox {
+        player.sonicbox_current()
+            .map(|t| (t.title.clone(), t.duration))
+            .unwrap_or_default()
+    } else {
+        player.current_track()
+            .map(|t| (t.title.clone(), t.duration))
+            .unwrap_or_default()
+    };
     log::info!("Track '{}' finished at {:.1}s (duration={:.1}s, playing_spot={})",
         track_title, position, track_dur, player.playing_spot);
 
