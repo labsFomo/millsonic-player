@@ -294,9 +294,55 @@ fn sync_trigger() -> &'static Notify {
     SYNC_TRIGGER.get_or_init(|| Notify::new())
 }
 
+// ── Health telemetry: last sync ──────────────────────────────────────────────
+// Records the outcome of the most recent sync attempt so the device "Health"
+// view can show when/how/whether content last synced. Tuple:
+// (at ISO8601, status "success"|"error", trigger "manual"|"auto").
+static LAST_SYNC: OnceLock<Mutex<Option<(String, String, String)>>> = OnceLock::new();
+
+fn last_sync_cell() -> &'static Mutex<Option<(String, String, String)>> {
+    LAST_SYNC.get_or_init(|| Mutex::new(None))
+}
+
+/// Outcome of the most recent sync, if any has run this session.
+pub fn last_sync() -> Option<(String, String, String)> {
+    last_sync_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn record_sync(status: &str, trigger: &str) {
+    let at = Utc::now().to_rfc3339();
+    let mut g = last_sync_cell().lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some((at, status.to_string(), trigger.to_string()));
+}
+
+// Trigger that woke the NEXT sync. A manual/forceSync request sets this to
+// "manual"; the periodic 300s wake leaves it "auto". Read+reset once per sync.
+static NEXT_SYNC_TRIGGER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn next_sync_trigger() -> &'static Mutex<Option<String>> {
+    NEXT_SYNC_TRIGGER.get_or_init(|| Mutex::new(None))
+}
+
+/// Read and clear the reason that triggered the upcoming sync (defaults "auto").
+fn take_sync_trigger() -> String {
+    let mut g = next_sync_trigger().lock().unwrap_or_else(|e| e.into_inner());
+    g.take().unwrap_or_else(|| "auto".to_string())
+}
+
+/// Content manifest version = fingerprint of the currently-loaded track list.
+/// Closest thing the player has to a "manifest version" of its content.
+pub fn current_manifest_version() -> Option<String> {
+    current_tracks_fp()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .filter(|s| !s.is_empty())
+}
+
 /// Call this to trigger an immediate sync (e.g. after pairing)
 pub fn trigger_sync() {
     log::info!("Sync triggered manually");
+    *next_sync_trigger().lock().unwrap_or_else(|e| e.into_inner()) = Some("manual".to_string());
     sync_trigger().notify_one();
 }
 
@@ -311,6 +357,9 @@ pub async fn flush_reports_before_exit() {
     if let Ok(mut p) = audio::player().lock() {
         p.stop();
     }
+    // Health: this is a KNOWN clean exit (graceful restart for updates etc.) —
+    // remove the run marker so the next boot doesn't flag it as a crash.
+    crate::telemetry::clear_running_marker();
 }
 
 /// R-04: remove any leftover partial download files (`*.part`) from the cache
@@ -367,10 +416,17 @@ pub async fn start_sync_loop(handle: AppHandle) {
             let device_id = cfg.device_id.clone().unwrap();
             let device_token = cfg.device_token.clone().unwrap();
 
+            // Health telemetry: capture WHY this sync ran (manual/forceSync vs
+            // the periodic auto wake) and its outcome.
+            let trigger = take_sync_trigger();
             match do_sync(&handle, &device_id, &device_token).await {
-                Ok(_) => log::info!("Sync completed successfully"),
+                Ok(_) => {
+                    log::info!("Sync completed successfully");
+                    record_sync("success", &trigger);
+                }
                 Err(e) => {
                     log::error!("Sync error: {}", e);
+                    record_sync("error", &trigger);
                     // Try offline fallback
                     handle_offline_fallback(&handle, &cfg);
                 }

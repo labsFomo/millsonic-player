@@ -1,7 +1,123 @@
 use crate::{api, audio, config};
 use sysinfo::System;
 use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use chrono::Utc;
 use tauri::{AppHandle, Emitter};
+
+// ── Health telemetry: lastCrash (dirty-shutdown / panic detection) ───────────
+// Populated ONCE at startup (main.rs setup) by inspecting the leftover
+// running.marker + panic.txt from the previous run. Reported on every telemetry
+// poll (the backend keeps the latest; repeating it is fine). Tuple:
+// (at ISO8601, class, message, phase).
+static LAST_CRASH: OnceLock<Mutex<Option<(String, String, String, Option<String>)>>> = OnceLock::new();
+
+fn last_crash_cell() -> &'static Mutex<Option<(String, String, String, Option<String>)>> {
+    LAST_CRASH.get_or_init(|| Mutex::new(None))
+}
+
+/// Record a detected crash from the previous run (called from main.rs setup).
+pub fn set_last_crash(at: String, class: String, message: String, phase: Option<String>) {
+    let mut g = last_crash_cell().lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some((at, class, message, phase));
+}
+
+/// Last detected unclean shutdown / panic, if any.
+pub fn last_crash() -> Option<(String, String, String, Option<String>)> {
+    last_crash_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn running_marker_path() -> std::path::PathBuf {
+    config::AppConfig::data_dir().join("running.marker")
+}
+
+fn panic_file_path() -> std::path::PathBuf {
+    config::AppConfig::data_dir().join("panic.txt")
+}
+
+/// Write the current time into the run marker (creates it if missing). Its mtime
+/// then approximates "last moment the process was alive" — if the process dies
+/// dirty, the marker survives and the next boot reads ≈ the crash time.
+pub fn touch_running_marker() {
+    let path = running_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, Utc::now().to_rfc3339());
+}
+
+/// Remove the run marker. Call on every KNOWN clean exit (graceful restart,
+/// unpair, etc.) so the next boot doesn't mistake it for a crash.
+pub fn clear_running_marker() {
+    let _ = std::fs::remove_file(running_marker_path());
+}
+
+/// Install a panic hook that records the panic message + location to panic.txt,
+/// so a Rust panic in a previous run can enrich LAST_CRASH on the next boot with
+/// a real message instead of just "unclean shutdown".
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = match info.payload().downcast_ref::<&str>() {
+            Some(s) => s.to_string(),
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => s.clone(),
+                None => "panic".to_string(),
+            },
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let body = format!("{}\nat {}\n{}", msg, loc, Utc::now().to_rfc3339());
+        let _ = std::fs::write(panic_file_path(), body);
+        default(info);
+    }));
+}
+
+/// Detect whether the PREVIOUS run exited uncleanly and, if so, populate
+/// LAST_CRASH. Then (re)create the run marker for THIS run. Call once at startup.
+///
+/// Logic:
+///   - If panic.txt exists → previous run panicked (Rust panic). class="panic",
+///     message=its contents. Consume (delete) it.
+///   - Else if running.marker exists → previous run died without removing it
+///     (native crash, kill -9, power loss). class="unclean_shutdown".
+///   - mtime of the marker ≈ the last time the process was alive ≈ crash time.
+pub fn detect_previous_crash() {
+    let marker = running_marker_path();
+    let panic_file = panic_file_path();
+
+    // Approximate crash time = marker mtime (last touch while alive).
+    let crash_at = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    if let Ok(panic_body) = std::fs::read_to_string(&panic_file) {
+        let msg = panic_body.trim();
+        log::warn!("Health: previous run PANICKED — {}", msg.lines().next().unwrap_or(msg));
+        set_last_crash(
+            crash_at,
+            "panic".to_string(),
+            if msg.is_empty() { "panic (sin mensaje)".to_string() } else { msg.to_string() },
+            Some("runtime".to_string()),
+        );
+        let _ = std::fs::remove_file(&panic_file);
+    } else if marker.exists() {
+        log::warn!("Health: previous run did NOT exit cleanly (run marker present) — flagging unclean shutdown");
+        set_last_crash(
+            crash_at,
+            "unclean_shutdown".to_string(),
+            "proceso terminó sin salida limpia (crash nativo o kill)".to_string(),
+            Some("runtime".to_string()),
+        );
+    }
+
+    // (Re)create the marker for the current run.
+    touch_running_marker();
+}
 
 pub fn get_telemetry() -> serde_json::Value {
     let mut sys = System::new_all();
@@ -45,7 +161,7 @@ pub fn get_telemetry() -> serde_json::Value {
     let free_bytes = (get_disk_free() * 1_073_741_824.0) as u64;
     let total_bytes = (get_disk_total() * 1_073_741_824.0) as u64;
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "cpuUsage": sys.global_cpu_usage(),
         "ramUsage": used_mem,
         "ramTotal": total_mem,
@@ -60,7 +176,31 @@ pub fn get_telemetry() -> serde_json::Value {
         "cacheBytes": cache_bytes,
         "freeBytes": free_bytes,
         "totalBytes": total_bytes,
-    })
+    });
+
+    if let Some(obj) = payload.as_object_mut() {
+        // Health: last sync (timestamp/status/trigger) — filled by the sync loop.
+        if let Some((at, status, trigger)) = crate::sync::last_sync() {
+            obj.insert("lastSyncAt".to_string(), serde_json::json!(at));
+            obj.insert("lastSyncStatus".to_string(), serde_json::json!(status));
+            obj.insert("lastSyncTrigger".to_string(), serde_json::json!(trigger));
+        }
+        // Health: last crash (unclean shutdown / panic), detected at startup.
+        if let Some((at, class, message, phase)) = last_crash() {
+            obj.insert("lastCrashAt".to_string(), serde_json::json!(at));
+            obj.insert("lastCrashClass".to_string(), serde_json::json!(class));
+            obj.insert("lastCrashMessage".to_string(), serde_json::json!(message));
+            obj.insert("lastCrashPhase".to_string(), serde_json::json!(phase));
+        }
+        // Health: current content manifest version = fingerprint of the loaded
+        // track list (ordered track ids). It's the closest thing the player has
+        // to a "manifest version" of the schedule/content it's currently playing.
+        if let Some(fp) = crate::sync::current_manifest_version() {
+            obj.insert("manifestVersion".to_string(), serde_json::json!(fp));
+        }
+    }
+
+    payload
 }
 
 fn get_disk_info() -> (f64, f64) {
@@ -217,6 +357,9 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
         }
         "restart" => {
             log::info!("Restart command received, restarting app");
+            // Health: known clean restart — clear the marker so the post-restart
+            // boot doesn't flag this as an unclean shutdown.
+            clear_running_marker();
             handle.restart();
         }
         _ => {}

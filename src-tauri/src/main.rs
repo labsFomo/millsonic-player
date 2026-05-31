@@ -124,6 +124,9 @@ async fn unpair_device(app: tauri::AppHandle, pin: String) -> Result<(), String>
         cfg.paired = false;
         cfg.unpair_pin = None;
     })?;
+    // Health: unpair is a deliberate state change, not a crash. Clear the marker
+    // so a later restart/exit isn't mis-flagged.
+    telemetry::clear_running_marker();
     Ok(())
 }
 
@@ -324,6 +327,14 @@ fn main() {
 
     setup_logging();
 
+    // Health telemetry: install the panic hook FIRST (so any panic from here on
+    // is captured to panic.txt), then check whether the PREVIOUS run exited
+    // cleanly. This detects native crashes / kills that a panic hook can't catch
+    // (the run marker would still be present). Finally (re)creates the marker for
+    // this run. Reported to the backend via get_telemetry (lastCrash*).
+    telemetry::install_panic_hook();
+    telemetry::detect_previous_crash();
+
     tauri::Builder::default()
         // U4: single-instance MUST be registered first. If a second copy is
         // launched in the same session, this callback runs in the EXISTING
@@ -423,8 +434,17 @@ fn main() {
             // This is the ONLY task that does blocking .lock() on audio player
             let handle3 = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut marker_tick: u64 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
+
+                    // Health: refresh the run marker ~every 30s so its mtime
+                    // stays close to "now". If the process dies dirty, the next
+                    // boot reads this mtime as the approximate crash time.
+                    marker_tick += 1;
+                    if marker_tick % 30 == 0 {
+                        telemetry::touch_running_marker();
+                    }
 
                     // Wrap in catch_unwind so a panic doesn't kill the app
                     let handle_ref = &handle3;

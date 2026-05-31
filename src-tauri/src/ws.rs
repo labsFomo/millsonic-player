@@ -1,4 +1,4 @@
-use crate::{api, audio, config, sync, telemetry};
+use crate::{audio, config, sync, telemetry};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -18,10 +18,6 @@ fn ws_connected() -> &'static AtomicBool {
 
 pub fn app_start_time() -> Instant {
     *APP_START.get_or_init(Instant::now)
-}
-
-pub fn is_ws_connected() -> bool {
-    ws_connected().load(Ordering::Relaxed)
 }
 
 fn set_ws_connected(connected: bool, handle: &AppHandle) {
@@ -204,96 +200,6 @@ pub async fn start_ws_loop(handle: AppHandle) {
             backoff_idx += 1;
         }
     }
-}
-
-/// HTTP polling - primary command/telemetry channel
-pub async fn start_http_polling_loop(_handle: AppHandle) {
-    let mut consecutive_failures: u32 = 0;
-
-    loop {
-        let cfg = config::AppConfig::load();
-        if !cfg.is_paired() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            consecutive_failures = 0;
-            continue;
-        }
-
-        let device_id = cfg.device_id.clone().unwrap();
-        let device_token = cfg.device_token.clone().unwrap();
-
-        // Send telemetry via HTTP with timeout — NEVER block
-        let telem = build_telemetry();
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            api::send_telemetry(&device_id, &device_token, &telem),
-        ).await;
-
-        match result {
-            Ok(Ok(resp)) => {
-                consecutive_failures = 0;
-                if let Some(pending) = resp.get("pendingCommand") {
-                    let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
-                        let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                        (cmd.to_string(), pending.clone())
-                    } else if let Some(cmd_str) = pending.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cmd_str) {
-                            let cmd = parsed.get("command").and_then(|c| c.as_str()).unwrap_or(cmd_str);
-                            (cmd.to_string(), parsed)
-                        } else {
-                            (cmd_str.to_string(), resp.clone())
-                        }
-                    } else {
-                        (String::new(), resp.clone())
-                    };
-
-                    if !command.is_empty() {
-                        log::info!("Executing pending command: {}", command);
-                        execute_command(&command, &cmd_data);
-                        // Ack with timeout too
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            ack_command_http(&device_id, &device_token, &resp),
-                        ).await;
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                consecutive_failures += 1;
-                log::error!("HTTP polling telemetry error: {} (failures: {})", e, consecutive_failures);
-            }
-            Err(_) => {
-                consecutive_failures += 1;
-                log::warn!("HTTP polling telemetry timed out (failures: {})", consecutive_failures);
-            }
-        }
-
-        // Exponential backoff: 10s → 20s → 30s → max 60s
-        let wait = match consecutive_failures {
-            0 => 10,
-            1 => 10,
-            2 => 20,
-            3 => 30,
-            _ => 60,
-        };
-        tokio::time::sleep(Duration::from_secs(wait)).await;
-    }
-}
-
-async fn ack_command_http(device_id: &str, device_token: &str, resp: &serde_json::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cmd_id = resp.get("commandId").and_then(|v| v.as_str()).unwrap_or("");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    client.post(format!("https://apifo.millsonic.com/api/v1/devices/{}/command-ack", device_id))
-        .json(&serde_json::json!({
-            "deviceToken": device_token,
-            "commandId": cmd_id,
-            "status": "executed"
-        }))
-        .send()
-        .await?;
-    Ok(())
 }
 
 fn build_telemetry() -> serde_json::Value {
