@@ -28,6 +28,23 @@ pub fn get_telemetry() -> serde_json::Value {
         }
     });
 
+    // Health stats: uptime + cache size. These feed the device "Health" view in
+    // the client (sin esto la sección venía vacía — vivían en el build_telemetry
+    // de ws.rs, que quedó muerto al unificar los pollers).
+    let uptime = crate::ws::app_start_time().elapsed().as_secs();
+    let cache_dir = config::AppConfig::cache_dir();
+    let cache_bytes: u64 = std::fs::read_dir(&cache_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    let free_bytes = (get_disk_free() * 1_073_741_824.0) as u64;
+    let total_bytes = (get_disk_total() * 1_073_741_824.0) as u64;
+
     serde_json::json!({
         "cpuUsage": sys.global_cpu_usage(),
         "ramUsage": used_mem,
@@ -39,6 +56,10 @@ pub fn get_telemetry() -> serde_json::Value {
         "currentTrackId": current_track_id,
         "appVersion": env!("CARGO_PKG_VERSION"),
         "debugMode": config::AppConfig::load().debug_mode,
+        "uptime": uptime,
+        "cacheBytes": cache_bytes,
+        "freeBytes": free_bytes,
+        "totalBytes": total_bytes,
     })
 }
 
