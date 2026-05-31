@@ -37,6 +37,13 @@ WantedBy=default.target
 
 **B) cron watchdog (lo que corre HOY en la QA):** un script cada minuto que relanza si no hay proceso. Simple y suficiente (`~/watchdog.sh` + `* * * * * ~/watchdog.sh`). Loguea cada relanzamiento con timestamp.
 
+⚠️ **El check de proceso debe matchear `millsonic-player` (el binario interno), no solo el AppImage.** El wrapper `MillsonicPlayer.AppImage` sale después de montar el squashfs y queda vivo solo el binario interno `millsonic-player`. Si el watchdog hace `pgrep -f MillsonicPlayer.AppImage` a secas, cree que el player está caído aunque esté sonando → relanza cada minuto y el single-instance lo rechaza (`Second instance launch ignored`) = churn inútil. Patrón correcto:
+```bash
+if ! pgrep -f 'MillsonicPlayer\.AppImage|millsonic-player' >/dev/null 2>&1; then
+  # ... relanzar ~/MillsonicPlayer.AppImage ...
+fi
+```
+
 ## Diagnóstico de crashes
 - Coredumps: `/proc/sys/kernel/core_pattern=/tmp/core.%e.%p` (gdb para backtrace).
 - `RUST_BACKTRACE=full` + stderr a archivo (captura panics de Rust).
