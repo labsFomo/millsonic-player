@@ -168,6 +168,17 @@ async function setupListeners() {
     const data = event.payload;
     if (!data) return;
 
+    // Once a track is actually playing, leave the "Conectando…" overlay and show
+    // the player — even when the sync had no download phase (cached resume, where
+    // the sync-progress 'complete' event never fires). Without this, a
+    // restart/crash-relaunch/boot that resumes from cache stayed stuck on the
+    // loading splash forever while the audio played.
+    if (isPaired) {
+      document.getElementById('loading-overlay').classList.add('hidden');
+      document.getElementById('pairing-screen').classList.add('hidden');
+      document.getElementById('player-screen').classList.remove('hidden');
+    }
+
     document.getElementById('track-title').textContent = data.title || '—';
     document.getElementById('track-artist').textContent = data.artist || '—';
     document.getElementById('time-current').textContent = formatTime(data.position);
