@@ -14,9 +14,19 @@ pub fn get_telemetry() -> serde_json::Value {
     let player = audio::player().try_lock().ok();
     let is_playing = player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
     let volume = player.as_ref().map(|p| p.get_volume()).unwrap_or(80);
-    let current_track_id = player
-        .as_ref()
-        .and_then(|p| p.current_track().map(|t| t.track_id.clone()));
+    // When a SonicBox vote is playing, current_track() still points at the grid
+    // playlist slot (the vote lives in a separate field). Report the vote's
+    // trackId so the backend knows what's ACTUALLY on air — peekNext excludes the
+    // currently-playing track to surface the NEXT vote, and without this the
+    // backend kept handing back the playing vote, wedging a grid song between
+    // every voted track instead of draining the queue.
+    let current_track_id = player.as_ref().and_then(|p| {
+        if p.playing_sonicbox {
+            p.sonicbox_current().map(|t| t.track_id.clone())
+        } else {
+            p.current_track().map(|t| t.track_id.clone())
+        }
+    });
 
     serde_json::json!({
         "cpuUsage": sys.global_cpu_usage(),

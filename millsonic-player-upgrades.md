@@ -463,6 +463,18 @@ RESTART ✅, y la cola: 4 comandos en <2s drenados en orden, ninguno perdido. La
 **Archivos:** `src-tauri/src/telemetry.rs` (intervalo + drenado de array), `src-tauri/src/main.rs`
 (quitar spawn ws), backend `src/devices/devices.service.ts` (`sendCommand` encola). Bump a 0.8.6.
 
-**Pendiente:** release firmado real (CI tag → AppImage firmado → `latest.json` en EC2) para que
-el fleet productivo se auto-actualice. El `ws.rs` quedó con `start_http_polling_loop` /
-`ack_command_http` sin usar (warnings dead-code) — candidatos a borrar en una limpieza.
+**✅ Released como `v0.8.7`** (no 0.8.6: la PC QA ya tenía un 0.8.6 local sin firmar, así que se
+bumpeó a 0.8.7 para que el auto-update lo reemplazara). Commit `365a6af` + tag → CI firma →
+GitHub Release con AppImage + `.sig` → `latest.json` en EC2 → fleet se auto-actualiza. El `ws.rs`
+quedó con `start_http_polling_loop` / `ack_command_http` sin usar (warnings dead-code) —
+candidatos a borrar en una limpieza.
+
+### Fix botón debug — SET_DEBUG shape (commit `8f1c5c0`, post-0.8.7)
+El admin manda `SET_DEBUG {value: {enabled: bool}}` (objeto), pero `handle_command` hacía
+`value.as_bool()` → sobre un objeto da `None` → `unwrap_or(false)` → **el debug nunca se prendía
+desde el admin** ("Debug OFF" parecía no hacer nada). Doble fix: (1) admin manda el **bool plano**
+(`value: bool`, consistente con SET_VOLUME) — deployado live; (2) player **robusto**: acepta
+`value:bool`, `value:{enabled:bool}`, `commandValue` y `enabled` top-level. El (2) está commiteado
+en `main`, **rueda en el próximo release firmado** (no se cortó 0.8.8 sólo por esto; el fix del
+admin ya lo resuelve en vivo con 0.8.7). Lección: el shape del `value` por comando importa —
+SET_VOLUME=`number`, SET_DEBUG=`bool`; si el cliente manda un objeto, parsearlo defensivamente.

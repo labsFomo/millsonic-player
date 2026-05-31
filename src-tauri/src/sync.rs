@@ -119,6 +119,19 @@ pub async fn start_resync_loop(handle: AppHandle) {
         if !p.is_playing() {
             continue;
         }
+        // R-10 only fixes long-term GRID drift. It must NEVER hard-cut:
+        //  - a SonicBox voted track that's currently on the air (would kill the
+        //    vote the customer just paid for), or one staged to play next;
+        //  - a track that just started (a vote ends OFF the server timeline, so
+        //    right after it the grid is legitimately "behind" the server — yanking
+        //    it would chop the fresh grid track a few seconds in, exactly the
+        //    "song jumped / repeated" glitch).
+        if p.playing_sonicbox || p.has_sonicbox_next() {
+            continue;
+        }
+        if p.get_position() < 20.0 {
+            continue;
+        }
         let local_id = p.current_track_id().unwrap_or_default();
         if local_id == server_id {
             continue; // aligned — nothing to do
