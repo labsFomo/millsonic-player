@@ -66,13 +66,16 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        // Exponential backoff interval: 60s base, up to 120s on failures
+        // Single command+telemetry poller (the redundant ws HTTP poller was
+        // removed — it had an incomplete command handler that swallowed
+        // UPDATE/SHOW_STATS in a race). 8s base keeps remote commands snappy;
+        // back off on repeated failures to avoid hammering a struggling network.
         let interval = match consecutive_failures {
-            0 => 60,
-            1 => 60,
-            2 => 80,
-            3 => 100,
-            _ => 120,
+            0 => 8,
+            1 => 8,
+            2 => 20,
+            3 => 40,
+            _ => 60,
         };
         tokio::time::sleep(Duration::from_secs(interval)).await;
 
@@ -97,27 +100,33 @@ pub async fn start_telemetry_loop(handle: AppHandle) {
                 consecutive_failures = 0;
                 crate::sync::set_connection_status(crate::sync::ConnectionStatus::Online, &handle);
                 if let Some(pending) = resp.get("pendingCommand") {
-                    let (command, cmd_data) = if let Some(cmd_obj) = pending.as_object() {
-                        let cmd = cmd_obj.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                        (cmd.to_string(), pending.clone())
-                    } else if let Some(cmd_str) = pending.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(cmd_str) {
-                            let cmd = parsed.get("command").and_then(|c| c.as_str()).unwrap_or(cmd_str);
-                            (cmd.to_string(), parsed)
-                        } else {
-                            (cmd_str.to_string(), resp.clone())
+                    // pendingCommand may be a single {command,value} object (legacy),
+                    // an ARRAY of them (command queue), or a JSON string of either.
+                    // Normalize to a list and execute each in order (FIFO). The API
+                    // clears pendingCommand on read (clear-on-read), so no ack is
+                    // needed — and acking would wipe any command queued in the
+                    // meantime.
+                    let items: Vec<serde_json::Value> = match pending {
+                        serde_json::Value::Array(arr) => arr.clone(),
+                        serde_json::Value::Object(_) => vec![pending.clone()],
+                        serde_json::Value::String(s) => {
+                            match serde_json::from_str::<serde_json::Value>(s) {
+                                Ok(serde_json::Value::Array(arr)) => arr,
+                                Ok(v @ serde_json::Value::Object(_)) => vec![v],
+                                _ => vec![serde_json::json!({ "command": s })],
+                            }
                         }
-                    } else {
-                        (String::new(), resp.clone())
+                        _ => vec![],
                     };
-                    if !command.is_empty() {
-                        handle_command(&command, &cmd_data, &handle);
-                        // ACK command so API clears pendingCommand
-                        let did = device_id.clone();
-                        let dtk = device_token.clone();
-                        tokio::spawn(async move {
-                            let _ = api::ack_command(&did, &dtk).await;
-                        });
+                    for item in &items {
+                        let command = item
+                            .get("command")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !command.is_empty() {
+                            handle_command(&command, item, &handle);
+                        }
                     }
                 }
             }

@@ -404,11 +404,11 @@ fn main() {
                 sync::start_resync_loop(handle_rs).await;
             });
 
-            // Start HTTP polling fallback (active when WS is disconnected)
-            let handle_poll = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                ws::start_http_polling_loop(handle_poll).await;
-            });
+            // NOTE: the redundant ws::start_http_polling_loop was removed — it ran
+            // a second telemetry poll with an INCOMPLETE command handler (no
+            // UPDATE/SHOW_STATS) that raced the telemetry loop and swallowed those
+            // commands. telemetry::start_telemetry_loop is now the single
+            // command+telemetry channel (polls every 8s, full handler).
 
             // Start now-playing emitter + track advancement check (every 1s)
             // This is the ONLY task that does blocking .lock() on audio player

@@ -425,3 +425,44 @@ Todos los **P0** + U1-U7 + R-10/11/18 cerrados.
    R-15 (backoff vigía offline), R-16 (salto al cambiar slot).
 4. **Refinamiento U2** — el delay de "Conectando…": mostrar now-playing apenas hay evento,
    no esperar el de conexión.
+
+---
+
+## Comandos remotos — cola FIFO + unificación de pollers · 0.8.6 (2026-05-31)
+> ⚠️ **Cómo se releasea esto en producción: ver `RELEASE.md`. NO se buildea local + scp.
+> Todo va por git tag → CI firma → `latest.json` → auto-update.** El 0.8.6 que se probó en la
+> PC QA fue un binario local SIN FIRMAR (atajo de test) — el release firmado de verdad queda
+> pendiente.
+
+**Problema reportado:** desde el admin `/devices`, todos los botones de comando del super-admin
+decían "command failed" (era un 403 por `@Roles(TENANT_ADMIN)` que excluía SUPER_ADMIN). Al
+arreglar eso, salieron 2 bugs más en el camino admin→API→player:
+
+1. **Carrera de dos pollers (root cause de UPDATE/SHOW_STATS rotos).** El player spawneaba DOS
+   loops que polleaban `/devices/:id/telemetry` y leían `pendingCommand` (clear-on-read):
+   - `telemetry::start_telemetry_loop` — handler **completo** (`handle_command`: play/pause/
+     skip/sync/setvolume/**update**/**show_stats**/set_debug/restart), cada **60s**.
+   - `ws::start_http_polling_loop` — handler **incompleto** (`execute_command`, sin UPDATE ni
+     SHOW_STATS → caían en `_ => unknown`), cada **10s**.
+   El de 10s ganaba la carrera casi siempre y, para UPDATE/SHOW_STATS, consumía el comando y lo
+   tiraba. Por eso esos 2 botones nunca hacían nada pese al 201.
+   **Fix:** eliminado el spawn de `ws::start_http_polling_loop` en `main.rs`.
+   `telemetry::start_telemetry_loop` queda como **único canal**, intervalo 60s→**8s**.
+
+2. **Overwrite → cola FIFO.** `pendingCommand` era un solo campo (cada comando pisaba al
+   anterior). Backend `DevicesService.sendCommand` ahora **encola** (append, cap 20): guarda
+   objeto `{command,value}` si hay 1 (compat con players viejos que solo parsean objeto/string)
+   o **array** si hay 2+. El player (`telemetry.rs`) **drena el array en orden**. Se quitó el
+   `ack` redundante (con cola borraría comandos recién encolados; el clear-on-read de
+   `reportTelemetry` ya limpia). **Zero migración de schema** (type-overload del campo existente).
+
+**Verificado** comando-por-comando contra el player real (log `~/.config/Millsonic/millsonic.log`):
+PLAY/PAUSE/SKIP/SYNC/SET_VOLUME/SET_DEBUG ✅, **SHOW_STATS ✅ y UPDATE ✅ (antes rotos)**,
+RESTART ✅, y la cola: 4 comandos en <2s drenados en orden, ninguno perdido. Latencia ~8s.
+
+**Archivos:** `src-tauri/src/telemetry.rs` (intervalo + drenado de array), `src-tauri/src/main.rs`
+(quitar spawn ws), backend `src/devices/devices.service.ts` (`sendCommand` encola). Bump a 0.8.6.
+
+**Pendiente:** release firmado real (CI tag → AppImage firmado → `latest.json` en EC2) para que
+el fleet productivo se auto-actualice. El `ws.rs` quedó con `start_http_polling_loop` /
+`ack_command_http` sin usar (warnings dead-code) — candidatos a borrar en una limpieza.
