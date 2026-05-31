@@ -2,6 +2,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use serde::Serialize;
 
+/// Cap de seguridad para la reproducción de un spot. Un anuncio real dura <30s; si el sink
+/// nunca reporta empty (mp3 corrupto, decode trancado, archivo borrado del cache), `is_finished`
+/// usa este cap para no congelar el player eternamente. Ver bug VM 0.9.5 (spot HOLA trancado 39min).
+const MAX_SPOT_PLAYBACK_SECONDS: f32 = 45.0;
+
 #[derive(Serialize, Clone, Debug)]
 pub struct TrackInfo {
     pub track_id: String,
@@ -399,7 +404,20 @@ impl AudioPlayer {
                     return true;
                 }
             }
-        } else if !self.playing_spot {
+        } else if self.playing_spot {
+            // SAFETY CAP: los spots no tienen duración almacenada, así que antes dependían
+            // SOLO de sink.empty(). Si el sink de un spot nunca reporta empty (mp3 raro/corrupto,
+            // decode trancado, o el archivo se borró del cache mientras sonaba), el player quedaba
+            // CONGELADO PARA SIEMPRE con playing_spot=true (bug real: VM 0.9.5 trancada ~39min en un
+            // HOLA). Un spot real dura <30s; este cap garantiza que jamás se cuelgue eterno.
+            if self.get_position() >= MAX_SPOT_PLAYBACK_SECONDS {
+                log::warn!(
+                    "Spot superó el cap de {}s (pos={:.0}s) — forzando finish para no colgar el player",
+                    MAX_SPOT_PLAYBACK_SECONDS, self.get_position()
+                );
+                return true;
+            }
+        } else {
             if let Some(track) = self.current_track() {
                 if track.duration > 1.0 && self.get_position() >= track.duration - 0.5 {
                     return true;
