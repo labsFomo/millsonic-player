@@ -337,11 +337,19 @@ fn take_sync_trigger() -> String {
 /// Content manifest version = fingerprint of the currently-loaded track list.
 /// Closest thing the player has to a "manifest version" of its content.
 pub fn current_manifest_version() -> Option<String> {
+    use std::hash::{Hash, Hasher};
     current_tracks_fp()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .filter(|s| !s.is_empty())
+        // The raw fingerprint is the full list of track ids (can be >1KB). Report
+        // a compact, stable 16-hex hash as the manifest "version" instead.
+        .map(|fp| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            fp.hash(&mut h);
+            format!("{:016x}", h.finish())
+        })
 }
 
 /// Call this to trigger an immediate sync (e.g. after pairing)
