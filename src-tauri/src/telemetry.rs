@@ -159,10 +159,15 @@ fn handle_command(cmd: &str, resp: &serde_json::Value, handle: &tauri::AppHandle
             return;
         }
         "set_debug" | "setdebug" | "debug" => {
-            let enabled = resp.get("value")
-                .or_else(|| resp.get("commandValue"))
-                .or_else(|| resp.get("enabled"))
-                .and_then(|v| v.as_bool())
+            // Accept every shape clients send: value:true (bool), value:{enabled:true}
+            // (object — what the admin UI sends), or a top-level `enabled`. The old
+            // code only did value.as_bool(), so the admin's {enabled} object always
+            // parsed as None -> false and debug could never be turned ON.
+            let val = resp.get("value");
+            let enabled = val.and_then(|v| v.as_bool())
+                .or_else(|| val.and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()))
+                .or_else(|| resp.get("commandValue").and_then(|v| v.as_bool()))
+                .or_else(|| resp.get("enabled").and_then(|v| v.as_bool()))
                 .unwrap_or(false);
             log::info!("Debug mode set to: {} (via telemetry command)", enabled);
             let _ = config::AppConfig::update_and_save(|cfg| { cfg.debug_mode = enabled; });
