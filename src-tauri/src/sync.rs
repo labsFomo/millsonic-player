@@ -293,6 +293,39 @@ fn seeded_shuffle<T: Clone>(arr: &[T], seed: &str) -> Vec<T> {
     result
 }
 
+/// Interleave ponderado por bloque — port BIT-EXACTO de `weighted-interleave.ts` del
+/// backend (modo bloques: ROCK×3, POP×2 → 3 rock, 2 pop, repite, con wrap-around).
+/// Recibe listas YA barajadas con su peso. Determinístico: generar N da el mismo prefijo.
+fn weighted_interleave<T: Clone>(lists: &[(Vec<T>, usize)], count: usize) -> Vec<T> {
+    let active: Vec<&(Vec<T>, usize)> = lists
+        .iter()
+        .filter(|(items, w)| *w > 0 && !items.is_empty())
+        .collect();
+    if active.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    if active.len() == 1 {
+        let (items, _) = active[0];
+        return (0..count).map(|i| items[i % items.len()].clone()).collect();
+    }
+    let mut cursors = vec![0usize; active.len()];
+    let mut out: Vec<T> = Vec::with_capacity(count);
+    while out.len() < count {
+        for (pi, (items, w)) in active.iter().enumerate() {
+            let mut k = 0;
+            while k < *w && out.len() < count {
+                out.push(items[(cursors[pi] + k) % items.len()].clone());
+                k += 1;
+            }
+            cursors[pi] += *w;
+            if out.len() >= count {
+                break;
+            }
+        }
+    }
+    out
+}
+
 static SYNC_TRIGGER: OnceLock<Notify> = OnceLock::new();
 
 fn sync_trigger() -> &'static Notify {
@@ -747,6 +780,8 @@ async fn do_sync(
     let mut current_tracks: Vec<serde_json::Value> = Vec::new();
     let mut playlist_id: Option<String> = None;
     let mut slot_start_time: Option<String> = None;
+    // multi-playlist ponderado: current_tracks ya viene barajado+intercalado → no re-shufflear.
+    let mut already_sequenced = false;
 
     for slot in &slots {
         let slot_day = slot.get("dayOfWeek").and_then(|d| d.as_u64()).unwrap_or(99) as u32;
@@ -756,7 +791,26 @@ async fn do_sync(
         if slot_day == day_of_week && current_time.as_str() >= start && current_time.as_str() < end {
             log::info!("Matched slot: day={} {}-{}", slot_day, start, end);
             slot_start_time = Some(start.to_string());
-            if let Some(playlist) = slot.get("playlist") {
+            // MULTI-playlist ponderado: si el slot trae `playlists` (>1), intercalar
+            // bit-exacto con el backend (cada playlist barajada con su seed + interleave).
+            let multi = slot.get("playlists").and_then(|p| p.as_array()).filter(|a| a.len() > 1).cloned();
+            if let Some(pls) = multi {
+                let date_str = now.format("%Y-%m-%d").to_string();
+                let lists: Vec<(Vec<serde_json::Value>, usize)> = pls
+                    .iter()
+                    .map(|pl| {
+                        let pid = pl.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let weight = pl.get("weight").and_then(|w| w.as_u64()).unwrap_or(1) as usize;
+                        let tracks = pl.get("tracks").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+                        let seed = format!("{}-{}-{}-{}", zone_id, date_str, start, pid);
+                        (seeded_shuffle(&tracks, &seed), weight)
+                    })
+                    .collect();
+                current_tracks = weighted_interleave(&lists, 3500);
+                playlist_id = pls.first().and_then(|p| p.get("id")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                already_sequenced = true;
+                log::info!("Matched MULTI slot: {} playlists → interleaved {} tracks", pls.len(), current_tracks.len());
+            } else if let Some(playlist) = slot.get("playlist") {
                 playlist_id = playlist.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let Some(tracks) = playlist.get("tracks").and_then(|t| t.as_array()) {
                     current_tracks = tracks.clone();
@@ -769,8 +823,9 @@ async fn do_sync(
         }
     }
 
-    // Apply seeded shuffle to match web player order
-    if !current_tracks.is_empty() {
+    // Apply seeded shuffle to match web player order (single-playlist).
+    // Multi-playlist ya viene barajado+intercalado bit-exacto → NO re-shufflear.
+    if !already_sequenced && !current_tracks.is_empty() {
         let date_str = now.format("%Y-%m-%d").to_string();
         let start_t = slot_start_time.as_deref().unwrap_or("00:00");
         let seed = format!("{}-{}-{}", zone_id, date_str, start_t);
@@ -1689,6 +1744,44 @@ pub fn check_track_advancement(handle: &AppHandle) {
             "position": 0.0,
             "artworkUrl": track.artwork_url,
         }));
+    }
+}
+
+#[cfg(test)]
+mod weighted_interleave_tests {
+    use super::*;
+
+    #[test]
+    fn golden_vector_rock3_pop2() {
+        // Mismo vector dorado que el backend (weighted-interleave.spec.ts).
+        let rock = vec!["r0", "r1", "r2", "r3", "r4"];
+        let pop = vec!["p0", "p1", "p2"];
+        let seq = weighted_interleave(&[(rock, 3), (pop, 2)], 15);
+        assert_eq!(
+            seq,
+            vec![
+                "r0", "r1", "r2", "p0", "p1", "r3", "r4", "r0", "p2", "p0", "r1",
+                "r2", "r3", "p1", "p2"
+            ]
+        );
+    }
+
+    #[test]
+    fn deterministic_prefix() {
+        let rock = vec!["r0", "r1", "r2", "r3", "r4"];
+        let pop = vec!["p0", "p1", "p2"];
+        let a = weighted_interleave(&[(rock.clone(), 3), (pop.clone(), 2)], 7);
+        let b = weighted_interleave(&[(rock, 3), (pop, 2)], 40);
+        assert_eq!(a, b[..7].to_vec());
+    }
+
+    #[test]
+    fn single_is_cyclic() {
+        let only = vec!["a", "b", "c"];
+        assert_eq!(
+            weighted_interleave(&[(only, 1)], 7),
+            vec!["a", "b", "c", "a", "b", "c", "a"]
+        );
     }
 }
 
