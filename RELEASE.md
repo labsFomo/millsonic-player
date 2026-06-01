@@ -106,6 +106,25 @@ curl -s "https://apifo.millsonic.com/api/v1/devices/update/linux/x86_64/0.0.1" |
 ```
 No requiere restart del backend (es un archivo bind-montado).
 
+### Paso manual: actualizar los binarios `-latest` de descarga (links del front)
+⚠️ **Regla Pablo:** la página de descarga (`app.millsonic.com/install` y el wizard de
+dispositivos) apunta SIEMPRE a links **nuestros estables** `apifo.millsonic.com/downloads/...-latest.*`
+(NUNCA GitHub ni versionado). En cada release hay que **sobreescribir esos mismos archivos** en el EC2
+para que el link sirva la versión nueva (el front NO se toca):
+
+```bash
+# Bajar los assets del Release y copiarlos encima de los -latest en el EC2:
+ssh ubuntu@44.213.88.75 'cd /home/ubuntu/millsonic/downloads && \
+  B=https://github.com/labsFomo/millsonic-player/releases/download/vX.Y.Z && \
+  curl -sSL -o millsonic-player-latest.AppImage "$B/Millsonic.Player_X.Y.Z_amd64.AppImage" && \
+  curl -sSL -o millsonic-player-latest.deb      "$B/Millsonic.Player_X.Y.Z_amd64.deb" && \
+  curl -sSL -o millsonic-player-latest.exe      "$B/Millsonic.Player_X.Y.Z_x64-setup.exe" && \
+  curl -sSL -o millsonic-player-latest.msi      "$B/Millsonic.Player_X.Y.Z_x64_en-US.msi"'
+# (Android: ya se copia a millsonic-android-latest.apk en su propio flujo.)
+# Verificar: curl -sIL https://apifo.millsonic.com/downloads/millsonic-player-latest.AppImage | head -1
+```
+TODO: automatizar esto como un step del job `release` (subir a EC2 `-latest`) para no hacerlo a mano.
+
 ---
 
 ## Checklist de "release bien hecho"
@@ -115,6 +134,7 @@ No requiere restart del backend (es un archivo bind-montado).
 - [ ] CI verde (al menos el job Linux + el job `release`).
 - [ ] GitHub Release con `*_amd64.AppImage` **y** `*_amd64.AppImage.sig`.
 - [ ] `latest.json` en EC2 apuntando a la versión nueva (verificado con curl al endpoint).
+- [ ] Binarios `-latest` de descarga sobreescritos en EC2 `/downloads/` (links del front sirven la versión nueva).
 - [ ] Un device viejo se auto-actualizó (verificar `appVersion` en `/devices` del admin).
 
 ## Anti-checklist (lo que NO es un release)
