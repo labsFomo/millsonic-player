@@ -373,6 +373,20 @@ fn main() {
             let cfg = config::AppConfig::load();
             log::info!("About to init audio...");
             let _ = audio::set_volume(cfg.volume);
+
+            // P0-7b: re-asegurar autostart EN CADA ARRANQUE si el device está emparejado.
+            // Antes el autostart sólo se habilitaba una vez (al emparejar). Eso fallaba en
+            // Linux/AppImage: el .desktop quedaba con un Exec= congelado al path del AppImage
+            // del momento del pairing → si el archivo se movía/renombraba/auto-actualizaba, o
+            // el .desktop nunca se creó, no se auto-corregía y el box no arrancaba solo tras
+            // reiniciar. enable() es idempotente y reescribe el .desktop con el path ACTUAL
+            // ($APPIMAGE en AppImage, /usr/bin en .deb), así se auto-sana en cada boot.
+            if cfg.paired {
+                match app.autolaunch().enable() {
+                    Ok(_) => log::info!("Autostart re-asserted on boot (paired device)"),
+                    Err(e) => log::warn!("Could not re-assert autostart on boot: {}", e),
+                }
+            }
             // P0-2: audio pre-flight. Warn the UI if no output device exists so the
             // operator sees it instead of a player that "plays" with no sound.
             if audio::is_available() {
