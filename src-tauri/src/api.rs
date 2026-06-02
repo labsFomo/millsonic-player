@@ -52,13 +52,52 @@ pub async fn pair_with_code(code: &str) -> Result<serde_json::Value, Box<dyn std
 }
 
 pub async fn sync_device(device_id: &str, device_token: &str) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let resp = client()
-        .get(format!("{}/devices/{}/sync?deviceToken={}", API_BASE, device_id, device_token))
+    // dedup=1: pedimos el payload deduplicado (mapa playlistsById + slots sin tracks inline,
+    // ~9x más chico). Rehidratamos acá mismo los tracks en cada slot desde el mapa, así el
+    // resto del código sigue leyendo slot.playlist.tracks / slot.playlists[].tracks igual que
+    // antes. Si el server no manda playlistsById (compat), queda tal cual.
+    let mut resp = client()
+        .get(format!("{}/devices/{}/sync?deviceToken={}&dedup=1", API_BASE, device_id, device_token))
         .send()
         .await?
         .json::<serde_json::Value>()
         .await?;
+    rehydrate_dedup(&mut resp);
     Ok(resp)
+}
+
+/// Rehidrata el payload deduplicado: copia los tracks de `playlistsById[id]` a cada
+/// `slot.playlist` y `slot.playlists[]` que tenga `id` pero no `tracks`. No-op si no hay
+/// `playlistsById` (payload viejo inline) — totalmente back-compat.
+fn rehydrate_dedup(resp: &mut serde_json::Value) {
+    let lib = match resp.get("playlistsById").cloned() {
+        Some(l) if l.is_object() => l,
+        _ => return,
+    };
+    fn fill(pl: &mut serde_json::Value, lib: &serde_json::Value) {
+        if pl.get("tracks").map_or(false, |t| t.is_array()) {
+            return;
+        }
+        if let Some(id) = pl.get("id").and_then(|i| i.as_str()).map(|s| s.to_string()) {
+            if let Some(tracks) = lib.get(&id).and_then(|p| p.get("tracks")).cloned() {
+                if let Some(obj) = pl.as_object_mut() {
+                    obj.insert("tracks".to_string(), tracks);
+                }
+            }
+        }
+    }
+    if let Some(schedule) = resp.get_mut("schedule").and_then(|s| s.as_array_mut()) {
+        for slot in schedule.iter_mut() {
+            if let Some(pl) = slot.get_mut("playlist") {
+                fill(pl, &lib);
+            }
+            if let Some(pls) = slot.get_mut("playlists").and_then(|p| p.as_array_mut()) {
+                for pl in pls.iter_mut() {
+                    fill(pl, &lib);
+                }
+            }
+        }
+    }
 }
 
 pub async fn send_telemetry(device_id: &str, device_token: &str, telemetry: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
