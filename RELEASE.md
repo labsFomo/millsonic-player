@@ -106,11 +106,19 @@ curl -s "https://apifo.millsonic.com/api/v1/devices/update/linux/x86_64/0.0.1" |
 ```
 No requiere restart del backend (es un archivo bind-montado).
 
-### Paso manual: actualizar los binarios `-latest` de descarga (links del front)
-⚠️ **Regla Pablo:** la página de descarga (`app.millsonic.com/install` y el wizard de
-dispositivos) apunta SIEMPRE a links **nuestros estables** `apifo.millsonic.com/downloads/...-latest.*`
-(NUNCA GitHub ni versionado). En cada release hay que **sobreescribir esos mismos archivos** en el EC2
-para que el link sirva la versión nueva (el front NO se toca):
+### Los binarios `-latest` de descarga (links del front) — YA NO es paso manual (2026-06-02)
+✅ **RESUELTO:** el backend ahora tiene `src/downloads/downloads.controller.ts` que sirve
+`apifo.millsonic.com/downloads/millsonic-player-latest.{AppImage,deb,exe,msi}` con un **302 redirect
+al asset del último release** (lee `latest.json`). O sea: con sólo actualizar el `latest.json` (paso
+de arriba), los links de descarga `-latest` ya apuntan a la versión nueva — **no hay que copiar archivos
+a mano**. Además `GET /api/v1/downloads/version` → `{desktop,android}` y la página `/install` lee esa
+versión EN VIVO (no más número hardcodeado en el front).
+
+ⓘ **Windows auto-update:** desde v0.9.9 el CI firma el instalador NSIS (`*_x64-setup.exe` + `.exe.sig`)
+y `latest.json` incluye `windows-x86_64` → los boxes Windows se auto-actualizan igual que Linux. (Antes
+el job buscaba el patrón viejo de Tauri v1 `*.nsis.zip.sig` → quedaba sin firma.)
+
+(LEGACY — sólo si el redirect del backend no estuviera disponible.) Sobreescribir los archivos a mano:
 
 ```bash
 # Bajar los assets del Release y copiarlos encima de los -latest en el EC2:
