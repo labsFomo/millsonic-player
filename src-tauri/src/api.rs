@@ -4,9 +4,14 @@ use std::path::Path;
 const API_BASE: &str = "https://apifo.millsonic.com/api/v1";
 
 fn client() -> reqwest::Client {
+    // Timeout amplio: el sync devuelve la grilla semanal COMPLETA con todos los tracks y
+    // URLs firmadas de S3 (zonas con catálogo grande = varios MB y TTFB de 5s+ porque el
+    // server firma cientos/miles de URLs por request). Con el viejo timeout de 5s el sync
+    // se cortaba ANTES de recibir el body (incluso en conexión buena) → el player nunca
+    // bajaba tracks y quedaba en "Conectando" para siempre. 45s da margen real.
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(45))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
