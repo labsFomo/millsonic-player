@@ -402,7 +402,9 @@ pub fn save_spot_schedules(spots: &[serde_json::Value]) {
         let start_time = spot.get("startTime").and_then(|v| v.as_str()).unwrap_or("00:00");
         let end_time = spot.get("endTime").and_then(|v| v.as_str()).unwrap_or("23:59");
         let frequency = spot.get("frequency").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let track_frequency = spot.get("trackFrequency").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
+        // 0 = sin trackFrequency (el backend manda null en modo "minutos"). NO defaultear a
+        // 4 acá: eso pisaba la señal de modo-minutos y forzaba cadencia por canciones.
+        let track_frequency = spot.get("trackFrequency").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let start_date = spot.get("startDate").and_then(|v| v.as_str()).map(|s| s.to_string());
         let end_date = spot.get("endDate").and_then(|v| v.as_str()).map(|s| s.to_string());
         let file_path = spot.get("_filePath").and_then(|v| v.as_str()).unwrap_or("");

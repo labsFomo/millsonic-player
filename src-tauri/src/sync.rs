@@ -226,6 +226,15 @@ fn last_spot_id() -> &'static Mutex<Option<String>> {
     LAST_SPOT_ID.get_or_init(|| Mutex::new(None))
 }
 
+// Epoch (segundos, server-time) en que sonó el último spot — para la cadencia POR MINUTOS
+// (`frequency`). Se inicializa a "ahora" en el primer chequeo (baseline) para que el primer
+// anuncio por tiempo espere el intervalo completo, y se actualiza cada vez que suena un spot.
+static LAST_SPOT_AT: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
+
+fn last_spot_at() -> &'static Mutex<Option<i64>> {
+    LAST_SPOT_AT.get_or_init(|| Mutex::new(None))
+}
+
 /// Pick a spot id from the eligible list that isn't the one we just played.
 /// Pure + testable: rotates past `last`; if the only eligible spot IS the last
 /// one, plays it anyway (can't leave dead air / skip a due ad).
@@ -1090,17 +1099,42 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
 
     let spots = db::load_spot_schedules();
 
+    // Cadencia por MINUTOS (`frequency`): epoch del último spot. Baseline = ahora en el
+    // primer chequeo, así el primer anuncio por tiempo espera el intervalo completo.
+    let now_epoch = now.timestamp();
+    let last_spot_epoch: Option<i64> = if let Ok(mut g) = last_spot_at().lock() {
+        if g.is_none() {
+            *g = Some(now_epoch);
+        }
+        *g
+    } else {
+        Some(now_epoch)
+    };
+
     // R-06: collect ALL eligible spots, then rotate past the last one played so
     // the same announcement doesn't repeat back-to-back.
     let mut eligible: Vec<(String, String)> = Vec::new();
-    for (id, days_json, start_time, end_time, track_freq, _freq, start_date, end_date, file_path) in &spots {
+    for (id, days_json, start_time, end_time, track_freq, freq, start_date, end_date, file_path) in &spots {
         // Check file exists
         if !std::path::Path::new(file_path).exists() {
             continue;
         }
 
-        // Check track frequency (passed in to avoid re-locking audio mutex)
-        if tracks_since_last_spot < *track_freq as usize {
+        // Cadencia: si tiene trackFrequency (>0) → modo CANCIONES (cada N temas). Si no
+        // (el backend manda trackFrequency=null → 0 cuando el modo es "minutos") → modo
+        // MINUTOS: elegible si pasaron `freq` minutos desde el último spot. Fallback
+        // histórico (ninguno seteado) = cada 4 canciones.
+        let freq_ok = if *track_freq > 0 {
+            tracks_since_last_spot >= *track_freq as usize
+        } else if *freq > 0 {
+            match last_spot_epoch {
+                Some(t) => (now_epoch - t) >= (*freq as i64) * 60,
+                None => true,
+            }
+        } else {
+            tracks_since_last_spot >= 4
+        };
+        if !freq_ok {
             continue;
         }
 
@@ -1135,6 +1169,10 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
     log::info!("Spot eligible: {} (file: {})", pick.0, pick.1);
     if let Ok(mut g) = last_spot_id().lock() {
         *g = Some(pick.0.clone());
+    }
+    // Reinicia la cadencia por minutos (cuenta desde que suena este spot).
+    if let Ok(mut g) = last_spot_at().lock() {
+        *g = Some(now_epoch);
     }
     Some(pick.1.clone())
 }
