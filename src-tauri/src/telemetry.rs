@@ -171,6 +171,7 @@ pub fn get_telemetry() -> serde_json::Value {
         "volume": volume,
         "currentTrackId": current_track_id,
         "appVersion": env!("CARGO_PKG_VERSION"),
+        "platform": std::env::consts::OS,
         "debugMode": config::AppConfig::load().debug_mode,
         "uptime": uptime,
         "cacheBytes": cache_bytes,
