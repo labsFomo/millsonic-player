@@ -79,18 +79,20 @@ async fn maybe_refresh_token() {
     }
 }
 
-// ── R-10: periodic re-sync to the server's now-playing ───────────────────────
-// Keeps branches of the same zone converged: if a player drifted onto a
-// DIFFERENT song than the server says is current, jump to the right one. We
-// never jump mid-song (only on wrong-song) and rate-limit to avoid churn, so a
-// correction is rare and only happens on real divergence.
-static LAST_RESYNC_MS: AtomicI64 = AtomicI64::new(0);
-const RESYNC_INTERVAL_SECS: u64 = 180;
-const RESYNC_MIN_GAP_MS: i64 = 300_000; // at most one correction per 5 min
+// ── R-10 v3: re-anclaje periódico al now-playing del server ──────────────────
+// Mantiene a todos los equipos de la zona en la misma LÍNEA de temas: cada
+// ANCHOR_EVERY_N_TRACKS temas reproducidos, re-alinea a la canción que el server
+// dice que va ahora. NO sincroniza por tema ni corta a la mitad (resync_to
+// crossfadea y es no-op si ya está alineado). Sin rate-limit: el contador de
+// temas ES el throttle. Offline → no hace nada (sigue la reproducción local).
+const RESYNC_POLL_SECS: u64 = 30;
+const ANCHOR_EVERY_N_TRACKS: u32 = 4;
 
 pub async fn start_resync_loop(handle: AppHandle) {
+    let mut last_seen_track = String::new();
+    let mut tracks_played: u32 = 0;
     loop {
-        tokio::time::sleep(Duration::from_secs(RESYNC_INTERVAL_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(RESYNC_POLL_SECS)).await;
 
         let cfg = config::AppConfig::load();
         let zone_id = match cfg.zone_id.clone() {
@@ -101,6 +103,7 @@ pub async fn start_resync_loop(handle: AppHandle) {
             Ok(j) => j,
             Err(_) => continue, // offline → leave local playback alone
         };
+        // Refresh del reloj corregido (R-11) en cada poll.
         if let Some(ts) = np.get("syncTimestamp").and_then(|v| v.as_i64()) {
             update_clock_offset(ts);
         }
@@ -108,13 +111,8 @@ pub async fn start_resync_loop(handle: AppHandle) {
             Some(c) => c,
             None => continue,
         };
-        if ct.get("isSpot").and_then(|v| v.as_bool()).unwrap_or(false) {
-            continue;
-        }
-        let server_id = ct.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if server_id.is_empty() {
-            continue;
-        }
+        let server_is_spot = ct.get("isSpot").and_then(|v| v.as_bool()).unwrap_or(false);
+        let server_id = ct.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let seek = ct.get("seekPosition").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
 
         let mut p = match audio::player().lock() {
@@ -124,33 +122,46 @@ pub async fn start_resync_loop(handle: AppHandle) {
         if !p.is_playing() {
             continue;
         }
-        // R-10 only fixes long-term GRID drift. It must NEVER hard-cut:
-        //  - a SonicBox voted track that's currently on the air (would kill the
-        //    vote the customer just paid for), or one staged to play next;
-        //  - a track that just started (a vote ends OFF the server timeline, so
-        //    right after it the grid is legitimately "behind" the server — yanking
-        //    it would chop the fresh grid track a few seconds in, exactly the
-        //    "song jumped / repeated" glitch).
+        // Detectar cambio de tema local para contar temas reproducidos.
+        let local_id = p.current_track_id().unwrap_or_default();
+        if !local_id.is_empty() && local_id != last_seen_track {
+            if !last_seen_track.is_empty() {
+                tracks_played += 1;
+            }
+            last_seen_track = local_id.clone();
+        }
+
+        // Todavía no toca re-anclar.
+        if tracks_played < ANCHOR_EVERY_N_TRACKS {
+            continue;
+        }
+
+        // Llegó la hora de re-anclar. Guardas (no se resetea el contador → se
+        // reintenta en el próximo poll si una guarda transitoria bloquea):
+        //  - nunca durante un voto SonicBox sonando o encolado;
+        //  - el server está en un spot → no re-anclar a un spot;
+        //  - tema recién arrancado (<20s) → no pisarlo (espejo del cuidado R-10).
         if p.playing_sonicbox || p.has_sonicbox_next() {
+            continue;
+        }
+        if server_is_spot || server_id.is_empty() {
             continue;
         }
         if p.get_position() < 20.0 {
             continue;
         }
-        let local_id = p.current_track_id().unwrap_or_default();
+
+        // Ciclo de anclaje cumplido. resync_to es no-op si ya estamos alineados.
+        tracks_played = 0;
         if local_id == server_id {
-            continue; // aligned — nothing to do
+            continue; // ya alineado — nada que hacer
         }
-        // Drifted onto a different song. Rate-limit corrections.
-        let now_ms = Utc::now().timestamp_millis();
-        let last = LAST_RESYNC_MS.load(Ordering::Relaxed);
-        if now_ms - last < RESYNC_MIN_GAP_MS {
-            log::info!("R-10: drift (local={} server={}) but within rate-limit window, skipping", local_id, server_id);
-            continue;
-        }
-        if p.resync_to(server_id, seek) {
-            LAST_RESYNC_MS.store(now_ms, Ordering::Relaxed);
-            log::info!("R-10 v2: re-aligned to server with crossfade — track {} (from 0, seek {:.0}s ignored)", server_id, seek);
+        if p.resync_to(&server_id, seek) {
+            log::info!(
+                "R-10 v3: re-anclado al server tras {} temas — crossfade a {} (desde 0)",
+                ANCHOR_EVERY_N_TRACKS, server_id,
+            );
+            last_seen_track = server_id.clone();
             if let Some(t) = p.current_track() {
                 let _ = handle.emit("now-playing", serde_json::json!({
                     "title": t.title,
