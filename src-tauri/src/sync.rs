@@ -150,13 +150,13 @@ pub async fn start_resync_loop(handle: AppHandle) {
         }
         if p.resync_to(server_id, seek) {
             LAST_RESYNC_MS.store(now_ms, Ordering::Relaxed);
-            log::info!("R-10: re-aligned to server — track {} seek {:.0}s", server_id, seek);
+            log::info!("R-10 v2: re-aligned to server with crossfade — track {} (from 0, seek {:.0}s ignored)", server_id, seek);
             if let Some(t) = p.current_track() {
                 let _ = handle.emit("now-playing", serde_json::json!({
                     "title": t.title,
                     "artist": t.artist,
                     "duration": t.duration,
-                    "position": seek,
+                    "position": 0.0,
                     "artworkUrl": t.artwork_url,
                 }));
             }

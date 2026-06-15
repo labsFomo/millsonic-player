@@ -488,7 +488,13 @@ impl AudioPlayer {
         self.playlist.get(self.current_index).map(|t| t.track_id.clone())
     }
 
-    pub fn resync_to(&mut self, track_id: &str, seek_secs: f32) -> bool {
+    /// R-10 v2: re-align to the server's current track with a smooth CROSSFADE from
+    /// the start of the correct track — NOT a hard `sink.stop()` mid-song (that was an
+    /// abrupt audible cut). The seek is intentionally ignored: we start the correct
+    /// track at 0 so the transition is musical and the progress bar starts with the
+    /// audio. For background music a 3s crossfade re-align reads as a DJ transition,
+    /// not a glitch. (Mirror del fix de Android 0.2.3, adaptado al engine del desktop.)
+    pub fn resync_to(&mut self, track_id: &str, _seek_secs: f32) -> bool {
         if self.playing_spot || self.playing_sonicbox {
             return false;
         }
@@ -497,11 +503,25 @@ impl AudioPlayer {
             return false; // already on the right song — never jump mid-song
         }
         if let Some(idx) = self.playlist.iter().position(|t| t.track_id == track_id) {
+            let track = self.playlist[idx].clone();
             self.current_index = idx;
-            let _ = self.play_current_at(seek_secs);
-            return true;
+            // Transición suave en vez de corte seco. start_crossfade es no-op si no
+            // hay audio (tests/headless); reset_position arranca la barra desde 0.
+            match self.start_crossfade(&track) {
+                Ok(()) => {
+                    self.reset_position();
+                    true
+                }
+                Err(_) => {
+                    // Fallback: si el crossfade no pudo arrancar, hard-cut desde 0
+                    // (peor que el crossfade pero mejor que quedar en la canción equivocada).
+                    let _ = self.play_current_at(0.0);
+                    true
+                }
+            }
+        } else {
+            false
         }
-        false
     }
 
     pub fn advance(&mut self) -> bool {
@@ -619,6 +639,30 @@ mod sonicbox_tests {
         p.clear_sonicbox_next();
         assert!(!p.has_sonicbox_next());
         assert!(p.take_sonicbox_next().is_none());
+    }
+
+    #[test]
+    fn resync_realigns_from_zero_not_mid_song() {
+        // R-10 v2: el re-sync re-alinea al track del server arrancándolo DESDE 0
+        // (crossfade, sin hard-cut a la posición seek). En headless start_crossfade
+        // es no-op y reset_position() deja la posición en ~0.
+        let mut p = AudioPlayer::new();
+        p.set_playlist(vec![track("a", 200.0), track("b", 200.0), track("c", 200.0)]);
+        p.play_file(&track("a", 200.0)).expect("simulated play ok");
+        assert_eq!(p.current_index, 0);
+
+        // Drift: el server dice que va "c"; re-alineamos.
+        let jumped = p.resync_to("c", 90.0);
+        assert!(jumped, "debe re-alinearse al track del server");
+        assert_eq!(p.current_index, 2, "índice movido al track actual del server");
+        assert_eq!(p.current_track_id().as_deref(), Some("c"));
+        // Arranca desde 0, NO desde el seek de 90s (no es corte a mitad).
+        assert!(p.get_position() < 5.0, "el re-align arranca el tema desde 0, no a mitad");
+
+        // Ya alineado → no-op (nunca salta mid-song en el track correcto).
+        assert!(!p.resync_to("c", 0.0), "sin salto si ya está en el track correcto");
+        // Track inexistente en el slot → no-op.
+        assert!(!p.resync_to("no-existe", 0.0));
     }
 
     #[test]
