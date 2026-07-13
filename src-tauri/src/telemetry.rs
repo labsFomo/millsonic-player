@@ -143,6 +143,11 @@ pub fn get_telemetry() -> serde_json::Value {
             p.current_track().map(|t| t.track_id.clone())
         }
     });
+    // Audio output health: surfaces PCs that are "playing" silently (no output
+    // device / wrong device). Read from the guard we already hold — never take a
+    // fresh player lock here, the guard is alive for the whole function.
+    let audio_available = player.as_ref().map(|p| p.is_audio_available()).unwrap_or(false);
+    let audio_device = player.as_ref().and_then(|p| p.device_name());
 
     // Health stats: uptime + cache size. These feed the device "Health" view in
     // the client (sin esto la sección venía vacía — vivían en el build_telemetry
@@ -172,6 +177,8 @@ pub fn get_telemetry() -> serde_json::Value {
         "currentTrackId": current_track_id,
         "appVersion": env!("CARGO_PKG_VERSION"),
         "platform": std::env::consts::OS,
+        "audioAvailable": audio_available,
+        "audioDevice": audio_device,
         "debugMode": config::AppConfig::load().debug_mode,
         "uptime": uptime,
         "cacheBytes": cache_bytes,

@@ -579,6 +579,46 @@ fn main() {
                 }
             });
 
+            // Audio device watchdog: recovers SILENT playback (UI says "playing"
+            // but no sound). The position watchdog above can't catch this — the
+            // position clock is wall-clock, so it keeps advancing even when the
+            // sink plays into a dead/wrong output device. Here we re-check the
+            // real system default output every 15s and rebuild the audio stream
+            // onto it, resuming the current track. Fixes the Windows cases where
+            // (a) the speakers weren't ready when the player autostarted and
+            // (b) the default output device changed after boot.
+            let handle_audio_wd = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // First check soon after boot so the autostart race resolves fast.
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                loop {
+                    let handle_ref = &handle_audio_wd;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match audio::health_check() {
+                            audio::AudioHealth::Unavailable => {
+                                log::error!("AUDIO-WD: no output device — playback is silent");
+                                let _ = handle_ref.emit("audio-unavailable", serde_json::json!({
+                                    "message": "No se detectó dispositivo de audio. Revisá la salida de sonido de Windows."
+                                }));
+                            }
+                            audio::AudioHealth::Restored => {
+                                log::info!("AUDIO-WD: audio output restored");
+                                let _ = handle_ref.emit("audio-restored", serde_json::json!({}));
+                            }
+                            audio::AudioHealth::DeviceChanged => {
+                                log::warn!("AUDIO-WD: switched to new default output device");
+                                let _ = handle_ref.emit("audio-restored", serde_json::json!({}));
+                            }
+                            audio::AudioHealth::Ok => {}
+                        }
+                    }));
+                    if let Err(e) = result {
+                        log::error!("PANIC in audio device watchdog: {:?}", e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+            });
+
             Ok(())
         })
         .run(tauri::generate_context!())

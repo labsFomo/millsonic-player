@@ -284,6 +284,13 @@ async function setupListeners() {
       '⚠ ' + (data.message || 'No se detectó dispositivo de audio. Revisá ALSA/PulseAudio/PipeWire.');
   });
 
+  // Audio recovered: the device watchdog re-acquired or switched the output
+  // device. Clear the warning banner so the operator sees the player is healthy.
+  await listen('audio-restored', () => {
+    const banner = document.getElementById('audio-warning-banner');
+    if (banner) banner.remove();
+  });
+
   await listen('ws-status', (event) => {
     const data = event.payload;
     if (!data) return;

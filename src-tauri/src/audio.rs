@@ -17,6 +17,20 @@ pub struct TrackInfo {
     pub artwork_url: Option<String>,
 }
 
+/// Result of an audio-output health check (see `AudioPlayer::audio_health_check`).
+/// Used by the audio device watchdog to recover silent playback on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioHealth {
+    /// Output device present and unchanged — nothing to do.
+    Ok,
+    /// The system default output device changed and we moved playback onto it.
+    DeviceChanged,
+    /// Audio was unavailable (boot race / no device) and has now been acquired.
+    Restored,
+    /// No usable output device — playback is currently silent.
+    Unavailable,
+}
+
 pub struct AudioPlayer {
     volume: f32,
     is_playing: bool,
@@ -29,6 +43,11 @@ pub struct AudioPlayer {
     _stream: Option<rodio::OutputStream>,
     _stream_handle: Option<rodio::OutputStreamHandle>,
     audio_available: bool,
+    /// Name of the system output device the current stream is bound to. The
+    /// audio device watchdog compares this against the live system default to
+    /// detect when the output changed under us (Windows: speakers wake after
+    /// autostart, user switches default, HDMI/BT (dis)connect).
+    current_device_name: Option<String>,
     pub consecutive_skips: usize,
     // Crossfade support
     crossfade_sink: Option<rodio::Sink>,
@@ -51,22 +70,22 @@ unsafe impl Send for AudioPlayer {}
 
 impl AudioPlayer {
     pub fn new() -> Self {
-        let (stream, handle, sink, available) = match rodio::OutputStream::try_default() {
-            Ok((stream, handle)) => {
+        let (stream, handle, sink, available, device_name) = match Self::open_output() {
+            Some((stream, handle, name)) => {
                 match rodio::Sink::try_new(&handle) {
                     Ok(sink) => {
                         sink.set_volume(0.8);
-                        (Some(stream), Some(handle), Some(sink), true)
+                        (Some(stream), Some(handle), Some(sink), true, name)
                     }
                     Err(e) => {
                         log::warn!("Could not create audio sink: {}", e);
-                        (None, None, None, false)
+                        (None, None, None, false, None)
                     }
                 }
             }
-            Err(e) => {
-                log::warn!("No audio output available: {}", e);
-                (None, None, None, false)
+            None => {
+                log::warn!("No audio output device available at startup");
+                (None, None, None, false, None)
             }
         };
 
@@ -81,6 +100,7 @@ impl AudioPlayer {
             _stream: stream,
             _stream_handle: handle,
             audio_available: available,
+            current_device_name: device_name,
             consecutive_skips: 0,
             crossfade_sink: None,
             crossfade_active: false,
@@ -93,6 +113,148 @@ impl AudioPlayer {
             playing_sonicbox: false,
             sonicbox_current: None,
             sonicbox_vote_id: None,
+        }
+    }
+
+    // ── Audio output device management ──────────────────────────────────────
+    /// Open an OutputStream on the *current* system default output device and
+    /// return it with the device's name (so the watchdog can spot a change).
+    fn open_output() -> Option<(rodio::OutputStream, rodio::OutputStreamHandle, Option<String>)> {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+        let host = rodio::cpal::default_host();
+        if let Some(device) = host.default_output_device() {
+            let name = device.name().ok();
+            match rodio::OutputStream::try_from_device(&device) {
+                Ok((stream, handle)) => return Some((stream, handle, name)),
+                Err(e) => log::warn!("Cannot open default output device by handle: {}", e),
+            }
+        }
+        // Fallback to rodio's own default resolution.
+        match rodio::OutputStream::try_default() {
+            Ok((stream, handle)) => Some((stream, handle, Self::current_default_device_name())),
+            Err(e) => {
+                log::warn!("No audio output available: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Name of the current system default output device (None if none / query fails).
+    fn current_default_device_name() -> Option<String> {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+        rodio::cpal::default_host()
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+    }
+
+    pub fn is_audio_available(&self) -> bool {
+        self.audio_available
+    }
+
+    pub fn device_name(&self) -> Option<String> {
+        self.current_device_name.clone()
+    }
+
+    /// Rebuild the audio output on the current default device and, if a real
+    /// track is playing, resume it at the current position so the swap is
+    /// (near) seamless. Returns true if audio is available afterwards.
+    fn reinit_output(&mut self) -> bool {
+        use rodio::Source;
+        let (stream, handle, name) = match Self::open_output() {
+            Some(t) => t,
+            None => {
+                self.audio_available = false;
+                return false;
+            }
+        };
+        let new_sink = match rodio::Sink::try_new(&handle) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("reinit_output: cannot create sink: {}", e);
+                self.audio_available = false;
+                return false;
+            }
+        };
+        new_sink.set_volume(self.volume);
+
+        // Any crossfade in flight is abandoned — cleanest correct state.
+        self.crossfade_sink = None;
+        self.crossfade_active = false;
+        self.crossfade_start = None;
+
+        // Resume the currently-playing file (grid or SonicBox) at its position.
+        // Spots are short one-shots: on a device switch we let the next advance
+        // recover instead of trying to re-stream them.
+        let resume = if self.is_playing && !self.playing_spot {
+            if self.playing_sonicbox {
+                self.sonicbox_current.clone()
+            } else {
+                self.current_track().cloned()
+            }
+        } else {
+            None
+        };
+
+        if let Some(track) = resume {
+            let pos = self.get_position();
+            match std::fs::File::open(&track.file_path) {
+                Ok(file) => {
+                    let reader = std::io::BufReader::new(file);
+                    match rodio::Decoder::new(reader) {
+                        Ok(source) => {
+                            if pos > 0.5 && (track.duration <= 0.0 || pos < track.duration - 1.0) {
+                                new_sink.append(
+                                    source.skip_duration(std::time::Duration::from_secs_f32(pos)),
+                                );
+                            } else {
+                                new_sink.append(source);
+                            }
+                            // Keep the position clock continuous across the swap.
+                            self.pause_elapsed = pos;
+                            self.play_started_at = Some(Instant::now());
+                            log::info!("reinit_output: resumed '{}' at {:.0}s", track.title, pos);
+                        }
+                        Err(e) => log::warn!("reinit_output: decode failed: {}", e),
+                    }
+                }
+                Err(e) => log::warn!("reinit_output: cannot open {}: {}", track.file_path, e),
+            }
+        }
+
+        self.sink = Some(new_sink);
+        self._stream = Some(stream);
+        self._stream_handle = Some(handle);
+        self.current_device_name = name;
+        self.audio_available = true;
+        true
+    }
+
+    /// Called periodically by the audio device watchdog. Detects (a) no output
+    /// device yet — the boot-time race under autostart where Windows hadn't
+    /// brought the speakers up when the player launched, and (b) the system
+    /// default output device changing at runtime, and rebuilds onto a working
+    /// device. Safe on Linux: with a stable default device name it's a no-op.
+    pub fn audio_health_check(&mut self) -> AudioHealth {
+        let current_default = Self::current_default_device_name();
+        if !self.audio_available {
+            if self.reinit_output() {
+                AudioHealth::Restored
+            } else {
+                AudioHealth::Unavailable
+            }
+        } else if current_default.is_some() && current_default != self.current_device_name {
+            log::warn!(
+                "Default output device changed: {:?} -> {:?}",
+                self.current_device_name,
+                current_default
+            );
+            if self.reinit_output() {
+                AudioHealth::DeviceChanged
+            } else {
+                AudioHealth::Unavailable
+            }
+        } else {
+            AudioHealth::Ok
         }
     }
 
@@ -579,6 +741,16 @@ pub fn is_available() -> bool {
         .lock()
         .map(|p| p.audio_available)
         .unwrap_or(false)
+}
+
+/// Run one audio-output health check (audio device watchdog entry point). Uses
+/// try_lock so it never blocks the audio thread: if the player is momentarily
+/// busy we just report Ok and re-check on the next tick.
+pub fn health_check() -> AudioHealth {
+    match player().try_lock() {
+        Ok(mut p) => p.audio_health_check(),
+        Err(_) => AudioHealth::Ok,
+    }
 }
 
 pub fn toggle() -> Result<String, String> {
