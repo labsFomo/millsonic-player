@@ -200,8 +200,8 @@ jobs:
             mkdir -p ~/.ssh
             echo "$SSH_KEY" > ~/.ssh/id_ed25519
             chmod 600 ~/.ssh/id_ed25519
-            ssh-keyscan -H 44.213.88.75 >> ~/.ssh/known_hosts 2>/dev/null
-            scp latest.json ubuntu@44.213.88.75:/home/ubuntu/millsonic/update-releases/latest.json || echo "SCP failed - update manually"
+            ssh-keyscan -H 18.233.253.250 >> ~/.ssh/known_hosts 2>/dev/null
+            scp latest.json ubuntu@18.233.253.250:/home/ubuntu/millsonic/update-releases/latest.json || echo "SCP failed - update manually"
           else
             echo "No SSH key configured - latest.json needs manual update"
             echo "Content:"
