@@ -184,7 +184,7 @@ jobs:
             const { VERSION, TAG, BASE, LINUX_SIG, MAC_SIG, WIN_SIG, WIN_URL } = process.env;
             const platforms={};
             if (LINUX_SIG) platforms["linux-x86_64"]={url:`${BASE}/Millsonic.Player_${VERSION}_amd64.AppImage`,signature:LINUX_SIG};
-            if (MAC_SIG)   platforms["darwin-universal"]={url:`${BASE}/Millsonic.Player_${VERSION}_universal.app.tar.gz`,signature:MAC_SIG};
+            if (MAC_SIG)   platforms["darwin-universal"]={url:`${BASE}/Millsonic.Player.app.tar.gz`,signature:MAC_SIG};
             if (WIN_SIG)   platforms["windows-x86_64"]={url:WIN_URL,signature:WIN_SIG};
             const out={version:VERSION,notes:`See https://github.com/labsFomo/millsonic-player/releases/tag/${TAG}`,pub_date:new Date().toISOString(),platforms};
             fs.writeFileSync("latest.json",JSON.stringify(out,null,2));
