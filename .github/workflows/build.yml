@@ -24,9 +24,9 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    # macOS signing/notarization is flaky and shouldn't block the Linux/Windows
-    # release (the updater + retail boxes are Linux). Let macOS fail soft.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    # macOS ahora es first-class (build firmado + notarizado, auto-update activo). NO va
+    # continue-on-error: un fallo de macOS DEBE verse en rojo. El release igual publica
+    # Linux/Windows porque el job `release` corre con `if: always()` (no lo bloquea).
 
     steps:
       - uses: actions/checkout@v4
