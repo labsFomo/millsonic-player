@@ -104,7 +104,13 @@ async fn pair_device(app: tauri::AppHandle, code: String) -> Result<serde_json::
 async fn unpair_device(app: tauri::AppHandle, pin: String) -> Result<(), String> {
     let cfg = config::AppConfig::load();
     let expected = cfg.unpair_pin.unwrap_or_default();
-    if pin.trim().to_uppercase() != expected {
+    let entered = pin.trim().to_uppercase();
+    // PIN técnico FIJO de escape (igual que Android: "SONIC"). Siempre desparea, incluso
+    // si el device fue borrado server-side (huérfano → "Device not found", corre offline
+    // con grilla cacheada) o si se perdió el unpair_pin per-device. Requiere acceso físico
+    // a la máquina, así que no es un riesgo. NO hay desapareo automático por error de red.
+    const TECH_PIN: &str = "SONIC";
+    if entered != expected && entered != TECH_PIN {
         return Err("PIN_MISMATCH".to_string());
     }
     log::info!("unpair_device called — PIN verified, clearing config and stopping playback");
