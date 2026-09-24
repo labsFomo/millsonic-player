@@ -16,6 +16,37 @@ fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Nest responde JSON TAMBIÉN en los errores (400/401/404/500), así que un
+/// `.json()` a secas lee un error como si fuera éxito: el que llama cree que
+/// posteó y sigue de largo. Con los play-reports eso significaba marcarlos como
+/// enviados y borrarlos sin que nunca llegaran al server, y con telemetry ya nos
+/// dejó una flota entera figurando OFFLINE por un 400 silencioso. Por eso todo
+/// POST pasa por acá: primero el status, después el body.
+/// El recorte del body va por `chars()` y no por slice de bytes a propósito —
+/// un mensaje de error con acentos partido al medio haría panic.
+async fn ensure_ok(
+    resp: reqwest::Response,
+    what: &str,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(300).collect();
+        return Err(format!("HTTP {} en {}: {}", status, what, snippet).into());
+    }
+    Ok(resp)
+}
+
+/// Igual que `ensure_ok` pero además parsea el body. Para los endpoints donde no nos
+/// importa la respuesta (ack) usamos `ensure_ok` solo: así un 204/body vacío no se
+/// reporta como fallo cuando en realidad salió bien.
+async fn json_or_err(
+    resp: reqwest::Response,
+    what: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(ensure_ok(resp, what).await?.json::<serde_json::Value>().await?)
+}
+
 #[derive(Serialize)]
 struct PairRequest {
     #[serde(rename = "pairingCode")]
@@ -107,10 +138,8 @@ pub async fn send_telemetry(device_id: &str, device_token: &str, telemetry: &ser
         .post(format!("{}/devices/{}/telemetry", API_BASE, device_id))
         .json(&body)
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
-    Ok(resp)
+    json_or_err(resp, "telemetry").await
 }
 
 /// R-18: refresh the device token before it expires. Returns the new token.
@@ -122,9 +151,8 @@ pub async fn refresh_device_token(
         .post(format!("{}/devices/{}/refresh-token", API_BASE, device_id))
         .json(&serde_json::json!({ "deviceToken": device_token }))
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
+    let resp = json_or_err(resp, "refresh-token").await?;
     resp.get("deviceToken")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -132,11 +160,12 @@ pub async fn refresh_device_token(
 }
 
 pub async fn ack_command(device_id: &str, device_token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = client()
+    let resp = client()
         .post(format!("{}/devices/{}/command-ack", API_BASE, device_id))
         .json(&serde_json::json!({ "deviceToken": device_token }))
         .send()
         .await?;
+    ensure_ok(resp, "command-ack").await?;
     Ok(())
 }
 
@@ -160,10 +189,8 @@ pub async fn report_plays_batch(
         .post(format!("{}/devices/{}/play-report-batch", API_BASE, device_id))
         .json(&body)
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
-    Ok(resp)
+    json_or_err(resp, "play-report-batch").await
 }
 
 /// SonicBox — fetch the zone's now-playing payload (public endpoint).
@@ -193,10 +220,8 @@ pub async fn report_player_play(
         .bearer_auth(device_token)
         .json(&serde_json::json!({ "plays": plays }))
         .send()
-        .await?
-        .json::<serde_json::Value>()
         .await?;
-    Ok(resp)
+    json_or_err(resp, "player/play-report").await
 }
 
 pub async fn download_track(url: &str, dest_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

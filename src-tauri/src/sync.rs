@@ -536,30 +536,67 @@ pub async fn start_report_flusher() {
     }
 }
 
+/// Guard in-flight del flusher. Se dispara desde tres lados (la task dedicada cada 300s,
+/// el final de cada sync y el flush previo a un restart) y todos leen las MISMAS filas
+/// `sent=0`: sin guard dos flushes solapados postean el mismo lote y el backend lo inserta
+/// dos veces — `play_history` no tiene unique, así que el cliente ve los plays duplicados.
+/// Con `try_lock` el segundo se va sin hacer nada; lo que quedó en la cola lo levanta el
+/// flush siguiente (está en SQLite, no se pierde).
+static FLUSH_IN_FLIGHT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn flush_in_flight() -> &'static tokio::sync::Mutex<()> {
+    FLUSH_IN_FLIGHT.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Tope de lotes por flush. Después de un finde offline hay miles de reportes encolados y
+/// de a 100 cada 300s el equipo tardaba ~1h en drenar (y los más viejos se vencían antes
+/// de salir). Loopeamos, pero acotado: esto corre dentro de la task de sync y no puede
+/// quedarse una hora posteando.
+const MAX_FLUSH_ROUNDS: usize = 20;
+
 async fn flush_pending_reports(device_id: &str, device_token: &str) {
-    let reports = db::get_pending_reports();
-    if reports.is_empty() { return; }
-
-    log::info!("Flushing {} pending play reports", reports.len());
-    let ids: Vec<i64> = reports.iter().map(|r| r.0).collect();
-    let report_data: Vec<serde_json::Value> = reports.iter().map(|r| {
-        serde_json::json!({
-            "trackId": r.1,
-            "zoneId": r.2,
-            "startedAt": r.3,
-            "durationSecs": r.4,
-        })
-    }).collect();
-
-    match api::report_plays_batch(device_id, device_token, report_data).await {
-        Ok(_) => {
-            db::mark_reports_sent(&ids);
-            log::info!("Flushed {} play reports successfully", ids.len());
+    let _guard = match flush_in_flight().try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            log::debug!("Flush de play reports ya en curso — se saltea esta corrida");
+            return;
         }
-        Err(e) => {
-            log::warn!("Failed to flush play reports (will retry): {}", e);
+    };
+
+    for round in 1..=MAX_FLUSH_ROUNDS {
+        let reports = db::get_pending_reports();
+        if reports.is_empty() { return; }
+        // Lote lleno = casi seguro queda cola atrás; pedimos otro en la vuelta siguiente.
+        let full_batch = reports.len() >= db::PENDING_REPORTS_BATCH;
+
+        log::info!("Flushing {} pending play reports (vuelta {})", reports.len(), round);
+        let ids: Vec<i64> = reports.iter().map(|r| r.0).collect();
+        let report_data: Vec<serde_json::Value> = reports.iter().map(|r| {
+            serde_json::json!({
+                "trackId": r.1,
+                "zoneId": r.2,
+                "startedAt": r.3,
+                "durationSecs": r.4,
+                "completed": r.5,
+            })
+        }).collect();
+
+        match api::report_plays_batch(device_id, device_token, report_data).await {
+            Ok(_) => {
+                db::mark_reports_sent(&ids);
+                log::info!("Flushed {} play reports successfully", ids.len());
+            }
+            Err(e) => {
+                // Sin marcar nada como enviado: las filas quedan en `sent=0` y se
+                // reintentan solas en el próximo ciclo.
+                log::warn!("Failed to flush play reports (will retry): {}", e);
+                return;
+            }
         }
+
+        if !full_batch { return; }
     }
+    log::warn!("Flush cortado por el tope de {} vueltas — sigue en el próximo ciclo", MAX_FLUSH_ROUNDS);
 }
 
 fn handle_offline_fallback(handle: &AppHandle, cfg: &config::AppConfig) {
@@ -1392,7 +1429,17 @@ pub fn check_track_advancement(handle: &AppHandle) {
             let crossfade_point = cur.duration - cfg.crossfade_duration as f32;
             if crossfade_point > 0.0 && position >= crossfade_point && !player.is_finished() {
                 let zone_id = cfg.zone_id.clone().unwrap_or_default();
-                let started_at = Utc::now().to_rfc3339();
+                // `started_at` es cuando ARRANCÓ el tema, no cuando termina: acá estamos en
+                // el punto de crossfade, o sea casi al final, así que le restamos lo ya
+                // reproducido. Con `Utc::now()` pelado toda la línea de tiempo de
+                // PlayHistory quedaba corrida ~un tema hacia adelante (mismo criterio que
+                // el path SonicBox más abajo).
+                let started_at =
+                    (Utc::now() - chrono::Duration::seconds(position.max(0.0) as i64)).to_rfc3339();
+                // Misma fórmula que usa el reporte de SonicBox: escuchado el 80% o más.
+                // El desktop nunca mandaba este flag y el backend defaulteaba a false, así
+                // que el 100% de los plays quedaba sin completar.
+                let completed = cur.duration > 1.0 && position >= cur.duration * 0.8;
 
                 if player.playing_sonicbox {
                     // ── C: SonicBox track ending → crossfade into the grid next,
@@ -1401,7 +1448,6 @@ pub fn check_track_advancement(handle: &AppHandle) {
                         if let Err(e) = player.start_crossfade(&next) {
                             log::error!("Crossfade (sb->grid) failed: {}", e);
                         } else {
-                            let completed = cur.duration > 1.0 && position >= cur.duration * 0.8;
                             sb_note_played(&cur.track_id);
                             if let Some(token) = cfg.device_token.clone() {
                                 let track_id = cur.track_id.clone();
@@ -1445,7 +1491,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
                             log::error!("Play (grid->sb) failed: {}", e);
                             player.set_sonicbox_next(sb, vote); // put it back for the finish path
                         } else {
-                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64, completed);
                             db::touch_track(&cur.track_id);
                             log::info!("Play grid '{}' -> SonicBox '{}' (vote={})", cur.title, sb.title, vote);
                             sb_note_played(&sb.track_id);
@@ -1482,7 +1528,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
                                 "Playing spot before next track (crossfade path, tracks since last: {})",
                                 player.tracks_since_last_spot + 1
                             );
-                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64, completed);
                             db::touch_track(&cur.track_id);
                             match player.play_spot_file(&spot_path) {
                                 Ok(_) => {
@@ -1500,7 +1546,7 @@ pub fn check_track_advancement(handle: &AppHandle) {
                         if let Err(e) = player.start_crossfade(&next) {
                             log::error!("Crossfade failed: {}", e);
                         } else {
-                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64);
+                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64, completed);
                             db::touch_track(&cur.track_id);
                             player.advance();
                             player.tracks_since_last_spot += 1;
@@ -1678,11 +1724,16 @@ pub fn check_track_advancement(handle: &AppHandle) {
     drop(player);
 
     // Now safe to call DB without holding audio lock
-    if let Some((track_id, _, _, _)) = &report_data {
+    if let Some((track_id, _, _, track_dur)) = &report_data {
         if position > 3.0 {
             let zone_id = cfg.zone_id.as_deref().unwrap_or("");
-            let started_at = Utc::now().to_rfc3339();
-            db::save_play_report(track_id, zone_id, &started_at, position as f64);
+            // Igual que en el path de crossfade: acá el tema YA terminó, así que
+            // `Utc::now()` es el instante de fin. El startedAt real es eso menos lo
+            // reproducido, si no PlayHistory queda corrido un tema entero.
+            let started_at =
+                (Utc::now() - chrono::Duration::seconds(position.max(0.0) as i64)).to_rfc3339();
+            let completed = *track_dur > 1.0 && position >= *track_dur * 0.8;
+            db::save_play_report(track_id, zone_id, &started_at, position as f64, completed);
             db::touch_track(track_id);
         }
     }
