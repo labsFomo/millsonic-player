@@ -231,19 +231,26 @@ fn sb_recently_played(track_id: &str) -> bool {
 // ── Spot anti-repeat (R-06) ──────────────────────────────────────────────────
 // Remember the last spot we played so we don't fire the same announcement twice
 // in a row when several are eligible. People hate hearing the same ad on loop.
+//
+// PERSISTIDO (0.9.17): antes vivía sólo en memoria. Un equipo que se reinicia (update,
+// corte de luz, el local que apaga la PC a la noche) volvía con el estado en cero.
 static LAST_SPOT_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn last_spot_id() -> &'static Mutex<Option<String>> {
-    LAST_SPOT_ID.get_or_init(|| Mutex::new(None))
+    LAST_SPOT_ID.get_or_init(|| Mutex::new(db::get_last_spot_schedule_id()))
 }
 
 // Epoch (segundos, server-time) en que sonó el último spot — para la cadencia POR MINUTOS
 // (`frequency`). Se inicializa a "ahora" en el primer chequeo (baseline) para que el primer
 // anuncio por tiempo espere el intervalo completo, y se actualiza cada vez que suena un spot.
+//
+// PERSISTIDO (0.9.17): sin esto, cada reinicio reseteaba el baseline a "ahora" y el primer
+// anuncio por minutos esperaba el intervalo completo OTRA VEZ. Un equipo que se reinicia
+// seguido con cadencia de 60 min podía no emitir nunca.
 static LAST_SPOT_AT: OnceLock<Mutex<Option<i64>>> = OnceLock::new();
 
 fn last_spot_at() -> &'static Mutex<Option<i64>> {
-    LAST_SPOT_AT.get_or_init(|| Mutex::new(None))
+    LAST_SPOT_AT.get_or_init(|| Mutex::new(db::get_last_spot_at()))
 }
 
 /// Pick a spot id from the eligible list that isn't the one we just played.
@@ -257,6 +264,388 @@ fn pick_spot<'a>(eligible: &'a [(String, String)], last: Option<&str>) -> Option
         .iter()
         .find(|(id, _)| Some(id.as_str()) != last)
         .or_else(|| eligible.first())
+}
+
+// ── Audios del box: rotación ROUND_ROBIN (Fase 5) ────────────────────────────
+// CONTRATO v1 — la especificación está en el backend, en el docblock de
+// `millsonic/src/spots/spot-assets.util.ts`, y la implementación de referencia ejecutable en
+// `spot-assets.util.spec.ts`. Android implementa LO MISMO: si algo de acá cambia, los dos
+// players rotan distinto y el reporte de emisión deja de ser reproducible.
+
+/// Único valor de `rotation` que este player entiende. Un valor FUTURO desconocido NO se
+/// adivina: se cae al audio por defecto (`audioUrl`), que es el paso 7 del contrato.
+const SPOT_ROTATION_ROUND_ROBIN: &str = "ROUND_ROBIN";
+
+/// Qué se va a reproducir en este turno del box, y con qué datos se reporta.
+#[derive(Debug, Clone, PartialEq)]
+struct SpotPick {
+    /// `SpotSchedule.id` (el `id` de la entrada de `spots[]`). Clave del cursor y `scheduleId`.
+    schedule_id: String,
+    /// `Spot.id` — el box. Es lo que identifica al anuncio en el reporte.
+    spot_id: String,
+    /// `SpotAsset.id` del audio que SUENA, que es lo que se reporta como `assetId`.
+    /// `None` = camino legacy (`audioUrl`), incluido el caso de la opción A en que la
+    /// rotación eligió un audio que no estaba bajado y suena el default.
+    asset_id: Option<String>,
+    /// `SpotAsset.id` que ELIGIÓ la rotación, independientemente de si pudo sonar.
+    /// El cursor avanza a éste SIEMPRE (paso 5): si avanzara sólo cuando suena, un audio
+    /// roto dejaría al box pegado en él para siempre.
+    cursor_asset_id: Option<String>,
+    /// Path local del audio a reproducir. `None` = no hay nada que suene → se reporta FAILED.
+    file_path: Option<String>,
+    /// Motivo del fallo cuando `file_path` es `None`. Literales cortos y estables para que el
+    /// reporte se pueda agrupar por causa.
+    failure_reason: Option<&'static str>,
+    /// Falla que hay que reportar **aunque el box igual suene** (opción A): el audio que le
+    /// tocaba por rotación no estaba bajado. Se reporta contra `cursor_asset_id`, no contra
+    /// `asset_id`, que en ese caso es `None`.
+    pending_failure: Option<&'static str>,
+    /// Duración declarada por el server, para poder distinguir COMPLETED de INTERRUPTED.
+    /// 0 = desconocida (el camino legacy no la trae).
+    expected_duration: f32,
+}
+
+/// PASO 4 del contrato, puro y aislado: elegir el audio del turno.
+///
+/// `i = position(id == last_asset_id)` (`None` si no está: primera vez, cursor perdido en un
+/// reinstall, o asset borrado/deshabilitado) → `elegido = A[(i + 1) % n]`. Con `n >= 2` esto
+/// garantiza `elegido.id != last_asset_id`: ANTI-REPEAT.
+///
+/// La lista llega TAL COMO LA MANDÓ EL SERVER (paso 1): no se reordena, no se baraja y no se
+/// filtra — ni siquiera los audios que no se pudieron bajar, porque sacarlos correría el
+/// índice y los dos players dejarían de coincidir.
+fn pick_rotation_asset<'a>(
+    assets: &'a [db::SpotAssetRow],
+    last_asset_id: Option<&str>,
+) -> Option<&'a db::SpotAssetRow> {
+    if assets.is_empty() {
+        return None; // paso 2: camino legacy
+    }
+    if assets.len() == 1 {
+        return Some(&assets[0]); // paso 3: defensivo, hoy el server no manda listas de 1
+    }
+    let next = match assets.iter().position(|a| Some(a.id.as_str()) == last_asset_id) {
+        Some(i) => (i + 1) % assets.len(),
+        None => 0,
+    };
+    Some(&assets[next])
+}
+
+/// Resuelve QUÉ audio le toca a este box, aplicando los pasos 1-4 y 7 del contrato.
+///
+/// Puro: recibe el cursor y lo devuelve en el `asset_id` del pick. El paso 5 (persistir el
+/// cursor ANTES de reproducir) y el 6 (reportar) los hace el llamador, que es el que tiene
+/// efectos; así todo el algoritmo se puede testear sin DB ni audio.
+fn resolve_spot_audio(row: &db::SpotScheduleRow, last_asset_id: Option<&str>) -> SpotPick {
+    let rotation_known = row
+        .rotation
+        .as_deref()
+        .map(|r| r == SPOT_ROTATION_ROUND_ROBIN)
+        .unwrap_or(false);
+
+    // Paso 7: `rotation` desconocido → nunca inventar, caer al audio por defecto.
+    if !row.assets.is_empty() && !rotation_known {
+        log::warn!(
+            "Box {} manda rotation={:?}, que este player no entiende — se usa el audio por defecto",
+            row.id, row.rotation
+        );
+    }
+
+    // El audio que ELIGIÓ la rotación. El cursor avanza a éste SIEMPRE, incluso cuando el
+    // archivo no está en disco y termina sonando el default: si no avanzara, un audio que
+    // falla siempre dejaría al box pegado en él para toda la vida (paso 5 del contrato).
+    let mut cursor_asset_id = None;
+    let mut pending_failure = None;
+
+    if rotation_known {
+        if let Some(asset) = pick_rotation_asset(&row.assets, last_asset_id) {
+            cursor_asset_id = Some(asset.id.clone());
+            let playable = !asset.file_path.is_empty()
+                && std::path::Path::new(&asset.file_path).exists();
+            if playable {
+                return SpotPick {
+                    schedule_id: row.id.clone(),
+                    spot_id: row.spot_id.clone(),
+                    asset_id: Some(asset.id.clone()),
+                    cursor_asset_id,
+                    file_path: Some(asset.file_path.clone()),
+                    failure_reason: None,
+                    pending_failure: None,
+                    expected_duration: asset.duration,
+                };
+            }
+            // OPCIÓN A (decisión de Pablo, 2026-10-30) — ESTE COMPORTAMIENTO ESTÁ ALINEADO CON
+            // ANDROID, no lo cambies en un solo player: el audio que le tocaba por rotación no
+            // está bajado (descarga fallida, cache limpiado, o todavía no sincronizó), así que
+            // se REPORTA la falla con su assetId y el box **suena igual** con su audio por
+            // defecto. Un anuncio al aire vale más que la exactitud del balance de la rotación;
+            // la contra conocida es que el default suena de más mientras falte la descarga.
+            // La alternativa que se descartó era dejar el turno MUDO.
+            // El server sólo manda assets con URL firmada, así que si no está en disco no es
+            // "el box no tiene audio": es que la descarga no llegó.
+            pending_failure = Some(FAIL_ASSET_NOT_CACHED);
+        }
+    }
+
+    // Paso 2: `assets` ausente/vacío (box de 1 audio, box TTS, box con todo apagado) →
+    // camino legacy con `audioUrl`. ESTE CASO ES EL FRECUENTE, no la excepción.
+    // También se llega acá por la opción A de arriba, con `pending_failure` ya cargado.
+    let legacy_playable =
+        !row.file_path.is_empty() && std::path::Path::new(&row.file_path).exists();
+    SpotPick {
+        schedule_id: row.id.clone(),
+        spot_id: row.spot_id.clone(),
+        // `None` a propósito aunque la rotación haya elegido uno: lo que suena es el default
+        // del box, y la emisión se tiene que reportar SIN assetId para no atribuirle al audio
+        // roto una emisión que nunca tuvo (Android hace exactamente esto: `rotated?.assetId`).
+        asset_id: None,
+        cursor_asset_id,
+        file_path: if legacy_playable { Some(row.file_path.clone()) } else { None },
+        failure_reason: if legacy_playable {
+            None
+        } else if row.audio_url.is_empty() {
+            // El box no tiene audio ninguno (TTS, o todos los audios deshabilitados).
+            Some(FAIL_AUDIO_MISSING)
+        } else {
+            Some(FAIL_DOWNLOAD)
+        },
+        pending_failure,
+        expected_duration: 0.0,
+    }
+}
+
+/// Motivos de fallo. Cortos, estables y en inglés como los del Android, para que el reporte
+/// agrupe igual en los dos players.
+const FAIL_AUDIO_MISSING: &str = "audio_missing";
+/// Mismo literal que `SPOT_FAILURE_ASSET_NOT_CACHED` del Android, para que el reporte de
+/// emisión agrupe por causa sin importar la plataforma. No lo cambies de un lado solo.
+const FAIL_ASSET_NOT_CACHED: &str = "asset_audio_not_cached";
+const FAIL_DOWNLOAD: &str = "download_failed";
+const FAIL_DEVICE: &str = "audio_device_error";
+const FAIL_CAP: &str = "playback_cap_45s";
+const FAIL_SHORT: &str = "short_playback";
+
+// ── Reporte de emisión: throttle de fallos ───────────────────────────────────
+// Un box roto se evalúa en CADA fin de tema (y ahora su turno no se consume, justamente para
+// que no le queme el turno a los demás), así que sin freno encolaría un FAILED cada 3 minutos
+// para siempre: ruido en el certificado y cola inflada. Se reporta el fallo una vez por
+// (schedule, motivo) y por ventana — alcanza de sobra para que soporte lo vea.
+const SPOT_FAILURE_THROTTLE_SECS: i64 = 30 * 60;
+
+static SPOT_FAILURE_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+fn spot_failure_last() -> &'static Mutex<HashMap<String, i64>> {
+    SPOT_FAILURE_LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Decisión pura del throttle, para poder testearla sin el global.
+fn failure_throttle_allows(last: Option<i64>, now: i64, window: i64) -> bool {
+    match last {
+        // `now < last` = el reloj se fue para atrás; dejar pasar es mejor que callarse para siempre.
+        Some(t) => now < t || now - t >= window,
+        None => true,
+    }
+}
+
+/// Encola una emisión FALLIDA (throttleada). `now_epoch` es server-time.
+///
+/// Reporta contra el audio que SONABA (`pick.asset_id`). Para la falla de la opción A —el
+/// audio que le tocaba no estaba bajado y suena el default— hay que reportar contra el que
+/// ELIGIÓ la rotación: para eso está [`report_spot_asset_failure`].
+fn report_spot_failure(pick: &SpotPick, zone_id: &str, reason: &str, now_epoch: i64) {
+    report_spot_asset_failure(pick, zone_id, pick.asset_id.as_deref(), reason, now_epoch)
+}
+
+/// Igual que [`report_spot_failure`] pero con el `assetId` explícito.
+fn report_spot_asset_failure(
+    pick: &SpotPick,
+    zone_id: &str,
+    asset_id: Option<&str>,
+    reason: &str,
+    now_epoch: i64,
+) {
+    // El asset entra en la clave del throttle: un box con 5 audios y 3 sin bajar tiene que
+    // poder reportar los 3, no sólo el primero que cayó en la ventana. Para el camino legacy
+    // (`asset_id: None`) la clave queda igual que antes.
+    let key = format!("{}|{}|{}", pick.schedule_id, asset_id.unwrap_or(""), reason);
+    {
+        let mut map = spot_failure_last().lock().unwrap_or_else(|e| e.into_inner());
+        if !failure_throttle_allows(map.get(&key).copied(), now_epoch, SPOT_FAILURE_THROTTLE_SECS) {
+            return;
+        }
+        map.insert(key, now_epoch);
+        // El mapa es minúsculo (una entrada por box×motivo), pero se poda igual para que un
+        // equipo con meses de uptime y muchos boxes no lo deje crecer.
+        map.retain(|_, &mut t| now_epoch < t || now_epoch - t <= SPOT_FAILURE_THROTTLE_SECS * 48);
+    }
+    log::error!(
+        "Anuncio NO emitido: spot={} schedule={} asset={:?} motivo={}",
+        pick.spot_id, pick.schedule_id, asset_id, reason
+    );
+    db::save_spot_report(
+        &pick.spot_id,
+        &pick.schedule_id,
+        asset_id,
+        zone_id,
+        // server_now(), NO Utc::now(): el backend DESCARTA (contando) toda emisión con
+        // playedAt fuera de [now-400d, now+24h], y el reloj de una PC de local puede estar
+        // corrido. R-11 ya nos da el offset del server — usarlo es la diferencia entre una
+        // emisión que figura en el certificado y una que se tira.
+        &server_now().to_rfc3339(),
+        None, // sin duración: no sonó. NULL != 0s.
+        db::SpotOutcome::Failed,
+        Some(reason),
+    );
+}
+
+// ── Reporte de emisión: el anuncio que está al aire ──────────────────────────
+// Qué spot está sonando AHORA, para poder cerrar el reporte cuando termine. Lo setea el
+// arranque del spot (los dos caminos de avance pasan por `start_spot_playback`) y lo consume
+// el fin del spot, que es un único lugar (`check_track_advancement`, rama `playing_spot`).
+#[derive(Debug, Clone)]
+struct OnAirSpot {
+    schedule_id: String,
+    spot_id: String,
+    asset_id: Option<String>,
+    zone_id: String,
+    started_at: String,
+    expected_duration: f32,
+}
+
+static ON_AIR_SPOT: OnceLock<Mutex<Option<OnAirSpot>>> = OnceLock::new();
+
+fn on_air_spot() -> &'static Mutex<Option<OnAirSpot>> {
+    ON_AIR_SPOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Clasificación pura del cierre de una emisión.
+/// `position` = segundos realmente reproducidos; `expected` = duración declarada (0 = no se sabe).
+fn classify_spot_end(position: f32, expected: f32) -> (db::SpotOutcome, Option<&'static str>) {
+    if position >= audio::MAX_SPOT_PLAYBACK_SECONDS {
+        // Lo cortó el cap anti-freeze: o el audio es más largo de lo que un anuncio debería,
+        // o el decode se trabó. En los dos casos el cliente NO escuchó el anuncio completo.
+        return (db::SpotOutcome::Interrupted, Some(FAIL_CAP));
+    }
+    if expected > 1.0 && position < expected * 0.8 {
+        // mp3 truncado/corrupto: el sink dijo "terminé" mucho antes de la duración real.
+        return (db::SpotOutcome::Interrupted, Some(FAIL_SHORT));
+    }
+    (db::SpotOutcome::Completed, None)
+}
+
+/// Cierra la emisión que estaba al aire (si había) y la encola.
+fn close_on_air_spot(position: f32, forced_reason: Option<&'static str>) {
+    let on_air = {
+        let mut g = on_air_spot().lock().unwrap_or_else(|e| e.into_inner());
+        g.take()
+    };
+    let Some(spot) = on_air else { return };
+    let (outcome, reason, duration) = match forced_reason {
+        // Cierre forzado (una emisión que quedó abierta por un camino raro): no se sabe cuánto
+        // sonó de verdad, así que la duración va NULL en vez de inventar un número — un
+        // promedio mentiroso es peor que un dato ausente.
+        Some(r) => (db::SpotOutcome::Interrupted, Some(r), None),
+        None => {
+            let (o, r) = classify_spot_end(position, spot.expected_duration);
+            (o, r, Some(position.max(0.0) as f64))
+        }
+    };
+    log::info!(
+        "Emisión cerrada: spot={} asset={:?} {:?}s outcome={}",
+        spot.spot_id, spot.asset_id, duration, outcome.as_str()
+    );
+    db::save_spot_report(
+        &spot.spot_id,
+        &spot.schedule_id,
+        spot.asset_id.as_deref(),
+        &spot.zone_id,
+        &spot.started_at,
+        duration,
+        outcome,
+        reason,
+    );
+}
+
+/// Arranca el anuncio elegido. ÚNICO punto de reproducción de spots del player: los DOS
+/// caminos de avance (crossfade y finish) llaman acá, así que la rotación, la persistencia
+/// del cursor, la cadencia y el reporte no pueden quedar sólo en uno de los dos — que es
+/// exactamente el bug que tuvo este repo cuando el crossfade no disparaba spots
+/// (player_two_advance_paths).
+///
+/// Devuelve `true` sólo si el audio realmente arrancó.
+fn start_spot_playback(
+    player: &mut audio::AudioPlayer,
+    pick: &SpotPick,
+    zone_id: &str,
+    now_epoch: i64,
+) -> bool {
+    // OPCIÓN A: el audio que le tocaba por rotación no estaba bajado. La falla se reporta
+    // igual (contra el asset que eligió la rotación) y abajo sigue sonando el default. Va
+    // ANTES del guard de `file_path` a propósito: si el default TAMPOCO está, se reportan las
+    // dos cosas —el audio que faltó y que el box quedó mudo—, que es lo que hace Android.
+    if let Some(reason) = pick.pending_failure {
+        report_spot_asset_failure(
+            pick,
+            zone_id,
+            pick.cursor_asset_id.as_deref(),
+            reason,
+            now_epoch,
+        );
+    }
+
+    let Some(path) = pick.file_path.as_deref() else {
+        report_spot_failure(
+            pick,
+            zone_id,
+            pick.failure_reason.unwrap_or(FAIL_AUDIO_MISSING),
+            now_epoch,
+        );
+        return false;
+    };
+
+    // Si por cualquier razón quedó una emisión abierta, se cierra como INTERRUPTED antes de
+    // abrir la nueva: así una emisión nunca se le atribuye al anuncio siguiente.
+    // (duración 0 porque acá `get_position()` es la del TEMA, no la del spot viejo; el cierre
+    // forzado manda la duración en NULL de todas formas.)
+    close_on_air_spot(0.0, Some("superseded"));
+
+    match player.play_spot_file(path) {
+        Ok(_) => {
+            {
+                let mut g = on_air_spot().lock().unwrap_or_else(|e| e.into_inner());
+                *g = Some(OnAirSpot {
+                    schedule_id: pick.schedule_id.clone(),
+                    spot_id: pick.spot_id.clone(),
+                    asset_id: pick.asset_id.clone(),
+                    zone_id: zone_id.to_string(),
+                    // Idem: server-time, para que el `@@unique (deviceId, spotId, playedAt)`
+                    // y la ventana de cordura del backend trabajen sobre el reloj correcto.
+                    started_at: server_now().to_rfc3339(),
+                    expected_duration: pick.expected_duration,
+                });
+            }
+            // ⚠️ ACÁ, y no antes: la cadencia por minutos se consume cuando el anuncio
+            // EMPEZÓ A SONAR DE VERDAD. Antes se consumía al elegirlo, así que un box roto
+            // reseteaba el reloj compartido de la zona y les quemaba el turno a los demás
+            // (ANUNCIOS-REPORTE-Y-BOXES.md). Se persiste para sobrevivir el reinicio.
+            if let Ok(mut g) = last_spot_at().lock() {
+                *g = Some(now_epoch);
+            }
+            db::set_last_spot_at(now_epoch);
+            true
+        }
+        Err(e) => {
+            // El cap de 45s y `playing_spot` quedan sanos (ver `play_spot_file`), así que la
+            // música sigue por el fall-through del llamador.
+            report_spot_failure(
+                pick,
+                zone_id,
+                &format!("{}: {}", FAIL_DEVICE, e),
+                now_epoch,
+            );
+            false
+        }
+    }
 }
 
 /// Connection status: Online, Offline (cached), Emergency
@@ -570,16 +959,12 @@ async fn flush_pending_reports(device_id: &str, device_token: &str) {
         let full_batch = reports.len() >= db::PENDING_REPORTS_BATCH;
 
         log::info!("Flushing {} pending play reports (vuelta {})", reports.len(), round);
-        let ids: Vec<i64> = reports.iter().map(|r| r.0).collect();
-        let report_data: Vec<serde_json::Value> = reports.iter().map(|r| {
-            serde_json::json!({
-                "trackId": r.1,
-                "zoneId": r.2,
-                "startedAt": r.3,
-                "durationSecs": r.4,
-                "completed": r.5,
-            })
-        }).collect();
+        let ids: Vec<i64> = reports.iter().map(|r| r.id).collect();
+        // El serializado vive en db.rs y es puro: es el contrato con el backend (una fila mal
+        // formada = 400 = batch ENTERO perdido) y tiene que poder testearse sin red.
+        // Una fila de música serializa exactamente igual que en 0.9.16.
+        let report_data: Vec<serde_json::Value> =
+            reports.iter().map(db::pending_report_json).collect();
 
         match api::report_plays_batch(device_id, device_token, report_data).await {
             Ok(_) => {
@@ -807,11 +1192,18 @@ async fn do_sync(
     } else {
         // Clear spots if none in sync
         db::save_spot_schedules(&[]);
-        // Also clean spot cache files
+        // Also clean spot cache files. `remove_dir_all` para el subdirectorio `assets/`:
+        // `remove_file` sobre un directorio falla en silencio y los audios de box viejos
+        // quedarían en disco para siempre.
         let spots_cache = config::AppConfig::data_dir().join("cache").join("spots");
         if let Ok(entries) = std::fs::read_dir(&spots_cache) {
             for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
+                let p = entry.path();
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(&p);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
         log::info!("Cleared spot cache (no spots in sync)");
@@ -1102,6 +1494,11 @@ async fn refresh_track_cache(tracks: &[serde_json::Value]) {
 async fn download_and_save_spots(spots: &[serde_json::Value]) {
     let cache_dir = config::AppConfig::data_dir().join("cache").join("spots");
     let _ = std::fs::create_dir_all(&cache_dir);
+    // Un subdirectorio propio para los audios del box: la ruta vieja era
+    // `cache/spots/{scheduleId}.mp3`, o sea UNA sola por box — con varios audios se pisaban
+    // entre ellos. Ahora la key del cache es el `SpotAsset.id`, que es único por audio.
+    let assets_dir = cache_dir.join("assets");
+    let _ = std::fs::create_dir_all(&assets_dir);
 
     let mut spots_with_paths: Vec<serde_json::Value> = Vec::new();
 
@@ -1112,33 +1509,100 @@ async fn download_and_save_spots(spots: &[serde_json::Value]) {
 
         let file_path = cache_dir.join(format!("{}.mp3", id));
 
+        let mut s = spot.clone();
+
+        // ── Audios del box (Fase 5) ──
+        // Se recorre `assets` EN EL ORDEN EN QUE VINO y se conserva la entrada incluso si la
+        // descarga falla (con `filePath: ""`). Filtrar los que no bajaron correría el índice
+        // de la rotación y este player dejaría de coincidir con Android — y además el fallo
+        // se volvería invisible, que es justo lo que vinimos a arreglar.
+        let mut asset_rows: Vec<serde_json::Value> = Vec::new();
+        if let Some(assets) = spot.get("assets").and_then(|v| v.as_array()) {
+            for a in assets {
+                let aid = a.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if aid.is_empty() {
+                    continue;
+                }
+                let aurl = a.get("audioUrl").and_then(|v| v.as_str()).unwrap_or("");
+                let duration = a.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let apath = assets_dir.join(format!("{}.mp3", aid));
+                if !apath.exists() && !aurl.is_empty() {
+                    log::info!("Downloading spot asset {} del box {}", aid, name);
+                    if let Err(e) = api::download_track(aurl, &apath).await {
+                        // No se corta el loop ni se pierde el box: el audio queda marcado como
+                        // no descargado y el reporte de emisión lo va a decir cuando le toque
+                        // el turno (`download_failed`), que es cuando importa.
+                        log::error!("Failed to download spot asset {} ({}): {}", aid, name, e);
+                    }
+                }
+                asset_rows.push(serde_json::json!({
+                    "id": aid,
+                    "filePath": if apath.exists() { apath.to_string_lossy().to_string() } else { String::new() },
+                    "duration": duration,
+                }));
+            }
+        }
+
         if !file_path.exists() && !audio_url.is_empty() {
             log::info!("Downloading spot: {} - {}", id, name);
             match api::download_track(audio_url, &file_path).await {
                 Ok(_) => log::info!("Downloaded spot: {}", name),
                 Err(e) => {
                     log::error!("Failed to download spot {}: {}", name, e);
-                    // Still save without file_path
-                    spots_with_paths.push(spot.clone());
+                    // Still save without file_path (pero CON los assets, si bajaron).
+                    if !asset_rows.is_empty() {
+                        if let Some(obj) = s.as_object_mut() {
+                            obj.insert("_assets".to_string(), serde_json::json!(asset_rows));
+                        }
+                    }
+                    spots_with_paths.push(s);
                     continue;
                 }
             }
         }
 
-        let mut s = spot.clone();
-        if file_path.exists() {
-            if let Some(obj) = s.as_object_mut() {
+        if let Some(obj) = s.as_object_mut() {
+            if file_path.exists() {
                 obj.insert("_filePath".to_string(), serde_json::json!(file_path.to_string_lossy().to_string()));
+            }
+            if !asset_rows.is_empty() {
+                obj.insert("_assets".to_string(), serde_json::json!(asset_rows));
             }
         }
         spots_with_paths.push(s);
     }
 
     db::save_spot_schedules(&spots_with_paths);
+    cleanup_spot_asset_cache(&assets_dir);
 }
 
-/// Check if a spot should play based on schedule rules
-fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Option<String> {
+/// Borra del cache los audios de box que ya no están en ninguna grilla. Sin esto, cada cuña
+/// vieja quedaría en disco para siempre y el cache de spots sólo crecería (el LRU de
+/// `cleanup_cache` sólo conoce la tabla `tracks`).
+fn cleanup_spot_asset_cache(assets_dir: &std::path::Path) {
+    let live: std::collections::HashSet<String> = db::load_spot_schedules()
+        .iter()
+        .flat_map(|r| r.assets.iter().map(|a| a.id.clone()).collect::<Vec<_>>())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(assets_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !stem.is_empty() && !live.contains(stem) {
+                let _ = std::fs::remove_file(&p);
+                log::info!("Spot asset fuera de grilla borrado del cache: {}", stem);
+            }
+        }
+    }
+}
+
+/// Check if a spot should play based on schedule rules.
+///
+/// Devuelve el `SpotPick` COMPLETO (qué box, qué audio y con qué datos reportarlo), no sólo
+/// el path: sin `spotId` no hay reporte de emisión posible, que es de lo que se trata 0.9.17.
+/// También devuelve un pick cuando el box NO tiene nada reproducible — el llamador encola el
+/// `FAILED` (throttleado) en vez de que el anuncio no suene y nadie se entere.
+fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Option<SpotPick> {
     let now = server_now().with_timezone(tz); // R-11: server-corrected time
     // Source of truth: backend uses JS getDay() = 0=Sun..6=Sat.
     let day_of_week = now.weekday().num_days_from_sunday();
@@ -1146,13 +1610,28 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
     let current_date = now.format("%Y-%m-%d").to_string();
 
     let spots = db::load_spot_schedules();
+    if spots.is_empty() {
+        return None;
+    }
 
     // Cadencia por MINUTOS (`frequency`): epoch del último spot. Baseline = ahora en el
     // primer chequeo, así el primer anuncio por tiempo espera el intervalo completo.
+    // El valor PERSISTE entre reinicios (db::get_last_spot_at), así que "primer chequeo" es
+    // sólo el de una instalación nueva. Si el valor guardado está en el FUTURO (reloj que se
+    // movió para atrás) se rebasea a ahora, o si no la cadencia quedaría trabada.
     let now_epoch = now.timestamp();
     let last_spot_epoch: Option<i64> = if let Ok(mut g) = last_spot_at().lock() {
-        if g.is_none() {
-            *g = Some(now_epoch);
+        match *g {
+            None => {
+                *g = Some(now_epoch);
+                db::set_last_spot_at(now_epoch);
+            }
+            Some(t) if t > now_epoch => {
+                log::warn!("Cadencia de anuncios con timestamp futuro ({t} > {now_epoch}) — rebase a ahora");
+                *g = Some(now_epoch);
+                db::set_last_spot_at(now_epoch);
+            }
+            Some(_) => {}
         }
         *g
     } else {
@@ -1161,22 +1640,22 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
 
     // R-06: collect ALL eligible spots, then rotate past the last one played so
     // the same announcement doesn't repeat back-to-back.
+    //
+    // ⚠️ Ya NO se descarta acá el box cuyo audio no está en disco. Ese `continue` silencioso
+    // era el agujero del pedido comercial: el anuncio no sonaba y no quedaba ni un rastro.
+    // Ahora el box llega al pick y el llamador reporta `FAILED`/`download_failed`.
     let mut eligible: Vec<(String, String)> = Vec::new();
-    for (id, days_json, start_time, end_time, track_freq, freq, start_date, end_date, file_path) in &spots {
-        // Check file exists
-        if !std::path::Path::new(file_path).exists() {
-            continue;
-        }
-
+    let mut by_id: HashMap<String, &db::SpotScheduleRow> = HashMap::new();
+    for row in &spots {
         // Cadencia: si tiene trackFrequency (>0) → modo CANCIONES (cada N temas). Si no
         // (el backend manda trackFrequency=null → 0 cuando el modo es "minutos") → modo
         // MINUTOS: elegible si pasaron `freq` minutos desde el último spot. Fallback
         // histórico (ninguno seteado) = cada 4 canciones.
-        let freq_ok = if *track_freq > 0 {
-            tracks_since_last_spot >= *track_freq as usize
-        } else if *freq > 0 {
+        let freq_ok = if row.track_frequency > 0 {
+            tracks_since_last_spot >= row.track_frequency as usize
+        } else if row.frequency > 0 {
             match last_spot_epoch {
-                Some(t) => (now_epoch - t) >= (*freq as i64) * 60,
+                Some(t) => (now_epoch - t) >= (row.frequency as i64) * 60,
                 None => true,
             }
         } else {
@@ -1187,42 +1666,71 @@ fn find_eligible_spot(tz: &chrono_tz::Tz, tracks_since_last_spot: usize) -> Opti
         }
 
         // Check day of week
-        let days: Vec<u32> = serde_json::from_str(days_json).unwrap_or_default();
+        let days: Vec<u32> = serde_json::from_str(&row.days_of_week).unwrap_or_default();
         if !days.is_empty() && !days.contains(&day_of_week) {
             continue;
         }
 
         // Check time range
-        if current_time.as_str() < start_time.as_str() || current_time.as_str() >= end_time.as_str() {
+        if current_time.as_str() < row.start_time.as_str() || current_time.as_str() >= row.end_time.as_str() {
             continue;
         }
 
         // Check date range
-        if let Some(sd) = start_date {
+        if let Some(sd) = &row.start_date {
             if !sd.is_empty() && current_date.as_str() < sd.as_str() {
                 continue;
             }
         }
-        if let Some(ed) = end_date {
+        if let Some(ed) = &row.end_date {
             if !ed.is_empty() && current_date.as_str() > ed.as_str() {
                 continue;
             }
         }
 
-        eligible.push((id.clone(), file_path.clone()));
+        eligible.push((row.id.clone(), row.file_path.clone()));
+        by_id.insert(row.id.clone(), row);
     }
 
     let last = last_spot_id().lock().ok().and_then(|g| g.clone());
-    let pick = pick_spot(&eligible, last.as_deref())?;
-    log::info!("Spot eligible: {} (file: {})", pick.0, pick.1);
+    let picked_schedule = pick_spot(&eligible, last.as_deref())?.0.clone();
+    let row = *by_id.get(&picked_schedule)?;
+
+    // El anti-repeat ENTRE BOXES se consume al ELEGIR, no al sonar: si se consumiera al sonar,
+    // un box roto que está primero en la lista sería el elegido en todos los turnos y los
+    // demás boxes de la zona no sonarían NUNCA (inanición). La cadencia por minutos sí se
+    // consume al sonar — está en `start_spot_playback`, y es el bug que vinimos a arreglar.
     if let Ok(mut g) = last_spot_id().lock() {
-        *g = Some(pick.0.clone());
+        *g = Some(picked_schedule.clone());
     }
-    // Reinicia la cadencia por minutos (cuenta desde que suena este spot).
-    if let Ok(mut g) = last_spot_at().lock() {
-        *g = Some(now_epoch);
+    db::set_last_spot_schedule_id(&picked_schedule);
+
+    // PASO 1-4 + 7 del contrato de rotación: qué audio del box le toca a este turno.
+    let cursor = db::get_spot_last_asset(&row.id);
+    let pick = resolve_spot_audio(row, cursor.as_deref());
+
+    // PASO 5: el cursor se persiste ANTES de reproducir, nunca después. Si se persistiera
+    // después, un audio roto que falla siempre dejaría el cursor clavado y el box se quedaría
+    // pegado en ese audio para siempre en vez de pasar al siguiente en el próximo turno.
+    // Ojo: `cursor_asset_id`, NO `asset_id`. Son distintos justo en el caso de la opción A
+    // (el audio que le tocaba no estaba bajado y suena el default): ahí `asset_id` es `None`
+    // porque lo que suena es el default, pero el cursor TIENE que avanzar igual o el box se
+    // queda pegado en el audio roto para siempre.
+    if let Some(asset_id) = pick.cursor_asset_id.as_deref() {
+        db::set_spot_last_asset(&row.id, asset_id);
     }
-    Some(pick.1.clone())
+
+    log::info!(
+        "Spot eligible: schedule={} spot={} asset={:?} file={:?}",
+        pick.schedule_id, pick.spot_id, pick.asset_id, pick.file_path
+    );
+    Some(pick)
+}
+
+/// Epoch server-time en segundos. Lo usan los dos caminos de avance para fechar reportes y
+/// consumir la cadencia con el MISMO reloj que `find_eligible_spot`.
+fn server_epoch() -> i64 {
+    server_now().timestamp()
 }
 
 /// Called from main.rs every second to check if track ended and advance
@@ -1521,24 +2029,25 @@ pub fn check_track_advancement(handle: &AppHandle) {
                             tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
                         // cur is at its crossfade point (effectively the latest
                         // finished track) → count it for spot frequency.
-                        if let Some(spot_path) =
+                        if let Some(pick) =
                             find_eligible_spot(&tz, player.tracks_since_last_spot + 1)
                         {
                             log::info!(
                                 "Playing spot before next track (crossfade path, tracks since last: {})",
                                 player.tracks_since_last_spot + 1
                             );
-                            db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64, completed);
-                            db::touch_track(&cur.track_id);
-                            match player.play_spot_file(&spot_path) {
-                                Ok(_) => {
-                                    let _ = handle.emit("now-playing", serde_json::json!({
-                                        "title": "📢 Spot", "artist": "Anuncio",
-                                        "duration": 0, "position": 0.0, "artworkUrl": null,
-                                    }));
-                                    return;
-                                }
-                                Err(e) => log::error!("Failed to play spot (crossfade path): {}", e),
+                            // El play del TEMA se reporta sólo si el anuncio efectivamente
+                            // interrumpe. Si no arranca, se cae al crossfade de abajo, que
+                            // reporta el tema él mismo — si se reportara acá, un anuncio
+                            // fallido duplicaría la fila de PlayHistory del tema.
+                            if start_spot_playback(&mut player, &pick, &zone_id, server_epoch()) {
+                                db::save_play_report(&cur.track_id, &zone_id, &started_at, position as f64, completed);
+                                db::touch_track(&cur.track_id);
+                                let _ = handle.emit("now-playing", serde_json::json!({
+                                    "title": "📢 Spot", "artist": "Anuncio",
+                                    "duration": 0, "position": 0.0, "artworkUrl": null,
+                                }));
+                                return;
                             }
                         }
                     }
@@ -1607,6 +2116,9 @@ pub fn check_track_advancement(handle: &AppHandle) {
     // If a spot just finished, resume normal playback
     if player.playing_spot {
         log::info!("Spot finished, resuming normal playback");
+        // ÚNICO lugar donde termina un anuncio, sin importar por qué camino de avance
+        // arrancó: acá se cierra el reporte de emisión (COMPLETED / INTERRUPTED).
+        close_on_air_spot(position, None);
         player.playing_spot = false;
         player.tracks_since_last_spot = 0;
         player.advance(); // Move to NEXT track (previous track already finished before spot)
@@ -1805,24 +2317,23 @@ pub fn check_track_advancement(handle: &AppHandle) {
     // Check if a spot should play before next track
     let tz_str = cfg.timezone.as_deref().unwrap_or("America/Montevideo");
     let tz: chrono_tz::Tz = tz_str.parse().unwrap_or(chrono_tz::America::Montevideo);
-    if let Some(spot_path) = find_eligible_spot(&tz, player.tracks_since_last_spot) {
+    if let Some(pick) = find_eligible_spot(&tz, player.tracks_since_last_spot) {
         log::info!("Playing spot before next track (tracks since last: {})", player.tracks_since_last_spot);
-        match player.play_spot_file(&spot_path) {
-            Ok(_) => {
-                let _ = handle.emit("now-playing", serde_json::json!({
-                    "title": "📢 Spot",
-                    "artist": "Anuncio",
-                    "duration": 0,
-                    "position": 0.0,
-                    "artworkUrl": null,
-                }));
-                return;
-            }
-            Err(e) => {
-                log::error!("Failed to play spot: {}", e);
-                // Fall through to normal track advancement
-            }
+        let zone_id = cfg.zone_id.clone().unwrap_or_default();
+        // Mismo helper que el camino de crossfade: rotación, cursor, cadencia y reporte son
+        // el MISMO código en los dos caminos de avance (player_two_advance_paths).
+        if start_spot_playback(&mut player, &pick, &zone_id, server_epoch()) {
+            let _ = handle.emit("now-playing", serde_json::json!({
+                "title": "📢 Spot",
+                "artist": "Anuncio",
+                "duration": 0,
+                "position": 0.0,
+                "artworkUrl": null,
+            }));
+            return;
         }
+        // Si no arrancó, ya quedó encolado el FAILED: se cae al avance normal y la música
+        // sigue. Un anuncio que falla NUNCA puede dejar el local en silencio.
     }
 
     log::info!("Track finished (pos={:.1}s), advancing...", position);
@@ -1943,5 +2454,419 @@ mod sonicbox_repeat_tests {
             sb_bump_tracks_played();
         }
         assert!(!sb_recently_played(id), "after the gap → eligible again");
+    }
+}
+
+#[cfg(test)]
+mod spot_rotation_contract_tests {
+    use super::*;
+
+    /// CONTRATO DE ROTACIÓN v1 — los resultados de estos tests tienen que ser IDÉNTICOS a los
+    /// de `millsonic/src/spots/spot-assets.util.spec.ts` (la implementación de referencia) y a
+    /// los del player Android. Si uno de los tres se desvía, el reporte de emisión deja de ser
+    /// reproducible y el cliente escucha la misma cuña siempre.
+
+    fn asset(id: &str) -> db::SpotAssetRow {
+        db::SpotAssetRow { id: id.into(), file_path: format!("/tmp/{id}.mp3"), duration: 20.0 }
+    }
+
+    fn assets(ids: &[&str]) -> Vec<db::SpotAssetRow> {
+        ids.iter().map(|i| asset(i)).collect()
+    }
+
+    /// Fila de `spot_schedules` como la devuelve la DB. Por defecto: box multi-audio con
+    /// rotación conocida y un audio por defecto cacheado.
+    fn row(assets: Vec<db::SpotAssetRow>, rotation: Option<&str>) -> db::SpotScheduleRow {
+        db::SpotScheduleRow {
+            id: "ss1".into(),
+            spot_id: "sp1".into(),
+            days_of_week: "[]".into(),
+            start_time: "00:00".into(),
+            end_time: "23:59".into(),
+            track_frequency: 4,
+            frequency: 0,
+            start_date: None,
+            end_date: None,
+            file_path: String::new(),
+            audio_url: "https://s3/default.mp3".into(),
+            assets,
+            rotation: rotation.map(|r| r.to_string()),
+        }
+    }
+
+    // ── Paso 2: sin assets → camino legacy ───────────────────────────────────
+
+    #[test]
+    fn paso2_sin_assets_usa_el_audio_por_defecto() {
+        let f = std::env::temp_dir().join("ms_rot_default.mp3");
+        std::fs::write(&f, b"x").unwrap();
+        let mut r = row(vec![], None);
+        r.file_path = f.to_string_lossy().to_string();
+
+        let pick = resolve_spot_audio(&r, None);
+        assert_eq!(pick.file_path.as_deref(), Some(r.file_path.as_str()));
+        assert_eq!(pick.asset_id, None, "el camino legacy no reporta assetId");
+        assert_eq!(pick.failure_reason, None);
+        assert_eq!(pick.spot_id, "sp1");
+        assert_eq!(pick.schedule_id, "ss1");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn paso2_lista_vacia_es_lo_mismo_que_ausente() {
+        // El server nunca manda `assets: []`, pero si lo hiciera no hay que romperse.
+        let r = row(vec![], Some(SPOT_ROTATION_ROUND_ROBIN));
+        let pick = resolve_spot_audio(&r, None);
+        assert_eq!(pick.asset_id, None);
+        assert_eq!(pick.file_path, None);
+    }
+
+    #[test]
+    fn paso2_box_sin_audio_ninguno_reporta_audio_missing() {
+        // Box TTS o box con TODOS los audios deshabilitados: el server manda audioUrl null.
+        let mut r = row(vec![], None);
+        r.audio_url = String::new();
+        let pick = resolve_spot_audio(&r, None);
+        assert_eq!(pick.file_path, None, "no suena");
+        assert_eq!(pick.failure_reason, Some(FAIL_AUDIO_MISSING));
+    }
+
+    #[test]
+    fn paso2_audio_por_defecto_que_no_bajo_reporta_download_failed() {
+        // Hay URL pero no está en disco: la descarga falló. Es el caso "el anuncio no suena y
+        // nadie se entera" que originó todo el reporte de emisión.
+        let mut r = row(vec![], None);
+        r.file_path = "/tmp/no-existe-ms-rot.mp3".into();
+        let pick = resolve_spot_audio(&r, None);
+        assert_eq!(pick.file_path, None);
+        assert_eq!(pick.failure_reason, Some(FAIL_DOWNLOAD));
+    }
+
+    // ── Paso 3: un solo asset ────────────────────────────────────────────────
+
+    #[test]
+    fn paso3_un_solo_asset_suena_igual_y_no_se_saltea_el_turno() {
+        let a = assets(&["a1"]);
+        // Aun si el cursor ya apunta a ese mismo asset: no hay otro, no se puede dejar el
+        // turno en silencio.
+        assert_eq!(pick_rotation_asset(&a, None).unwrap().id, "a1");
+        assert_eq!(pick_rotation_asset(&a, Some("a1")).unwrap().id, "a1");
+        assert_eq!(pick_rotation_asset(&a, Some("viejo")).unwrap().id, "a1");
+    }
+
+    // ── Paso 4: (i + 1) % n ──────────────────────────────────────────────────
+
+    #[test]
+    fn paso4_cursor_ausente_arranca_en_el_primero() {
+        let a = assets(&["a1", "a2", "a3"]);
+        assert_eq!(pick_rotation_asset(&a, None).unwrap().id, "a1");
+    }
+
+    #[test]
+    fn paso4_avanza_uno_y_da_la_vuelta() {
+        let a = assets(&["a1", "a2", "a3"]);
+        assert_eq!(pick_rotation_asset(&a, Some("a1")).unwrap().id, "a2");
+        assert_eq!(pick_rotation_asset(&a, Some("a2")).unwrap().id, "a3");
+        assert_eq!(pick_rotation_asset(&a, Some("a3")).unwrap().id, "a1");
+    }
+
+    #[test]
+    fn paso4_cursor_con_id_que_ya_no_esta_en_la_lista_arranca_en_el_primero() {
+        // Asset borrado o deshabilitado: el server ya no lo manda. i = None → A[0], que nunca
+        // puede ser el que acaba de sonar (no está en la lista).
+        let a = assets(&["a2", "a3"]);
+        assert_eq!(pick_rotation_asset(&a, Some("a1-borrado")).unwrap().id, "a2");
+    }
+
+    #[test]
+    fn paso4_anti_repeat_en_turnos_consecutivos() {
+        let a = assets(&["a1", "a2", "a3", "a4", "a5"]);
+        let mut cursor: Option<String> = None;
+        let mut secuencia: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            let elegido = pick_rotation_asset(&a, cursor.as_deref()).unwrap().id.clone();
+            // ANTI-REPEAT: con n >= 2 nunca repite el inmediatamente anterior.
+            assert_ne!(Some(elegido.as_str()), cursor.as_deref(), "repitió el audio anterior");
+            cursor = Some(elegido.clone());
+            secuencia.push(elegido);
+        }
+        // Round-robin puro, mismo vector que la referencia en JS.
+        assert_eq!(
+            secuencia,
+            vec!["a1","a2","a3","a4","a5","a1","a2","a3","a4","a5","a1","a2"]
+        );
+    }
+
+    #[test]
+    fn paso1_el_orden_del_server_es_autoritativo_no_se_reordena() {
+        // La misma lista en otro orden (el panel reordenó) da otra elección: el player NO
+        // ordena nada por su cuenta, usa el índice tal como vino.
+        let directo = assets(&["a1", "a2", "a3"]);
+        let reordenada = assets(&["a3", "a1", "a2"]);
+        assert_eq!(pick_rotation_asset(&directo, Some("a1")).unwrap().id, "a2");
+        assert_eq!(pick_rotation_asset(&reordenada, Some("a1")).unwrap().id, "a2");
+        // Y el cursor sigue siendo válido tras el reorden: el anti-repeat se mantiene.
+        assert_eq!(pick_rotation_asset(&reordenada, Some("a3")).unwrap().id, "a1");
+    }
+
+    /// Crea archivos de verdad en disco: `resolve_spot_audio` decide con `Path::exists()`, así
+    /// que un asset "bajado" tiene que existir o el test prueba otra cosa.
+    fn en_disco(nombre: &str) -> String {
+        let dir = std::env::temp_dir().join("ms-spot-rot-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join(nombre);
+        std::fs::write(&f, b"x").unwrap();
+        f.to_string_lossy().into_owned()
+    }
+
+    fn asset_bajado(id: &str) -> db::SpotAssetRow {
+        db::SpotAssetRow {
+            id: id.into(),
+            file_path: en_disco(&format!("{id}.mp3")),
+            duration: 20.0,
+        }
+    }
+
+    fn asset_sin_bajar(id: &str) -> db::SpotAssetRow {
+        db::SpotAssetRow { id: id.into(), file_path: String::new(), duration: 20.0 }
+    }
+
+    #[test]
+    fn paso1_un_asset_que_no_bajo_sigue_en_la_lista_y_no_corre_el_indice() {
+        // Si se filtrara el roto, el índice se correría y este player dejaría de coincidir con
+        // Android. El roto CONSERVA su turno y el cursor avanza a él igual (paso 5): si no
+        // avanzara, el box se quedaría pegado en el audio roto para siempre.
+        //
+        // Y acá se fija la OPCIÓN A (decisión de Pablo, 2026-10-30), que es lo que hace
+        // Android: lo que suena es el audio POR DEFECTO del box, la emisión NO se le atribuye
+        // al audio roto, y la falla se reporta aparte con su assetId.
+        let default_file = en_disco("default.mp3");
+        let a = vec![asset_bajado("a1"), asset_sin_bajar("a2"), asset_bajado("a3")];
+        let mut r = row(a, Some(SPOT_ROTATION_ROUND_ROBIN));
+        r.file_path = default_file.clone();
+
+        let pick = resolve_spot_audio(&r, Some("a1"));
+        assert_eq!(pick.cursor_asset_id.as_deref(), Some("a2"), "el roto conserva su turno");
+        assert_eq!(pick.file_path.as_deref(), Some(default_file.as_str()), "suena el default");
+        assert_eq!(pick.asset_id, None, "la emisión es del default, no del audio roto");
+        assert_eq!(pick.pending_failure, Some(FAIL_ASSET_NOT_CACHED), "la falla se reporta igual");
+        assert_eq!(pick.failure_reason, None, "el box SUENA: no es una emisión fallida");
+
+        // Próximo turno (el cursor ya avanzó a a2 ANTES de reproducir — paso 5): sigue a3.
+        let pick = resolve_spot_audio(&r, Some("a2"));
+        assert_eq!(pick.asset_id.as_deref(), Some("a3"));
+        assert_eq!(pick.pending_failure, None);
+    }
+
+    #[test]
+    fn opcion_a_si_el_default_tampoco_bajo_el_box_queda_mudo_y_se_reportan_las_dos_cosas() {
+        // Peor caso de la opción A: no está el audio del turno NI el default. Ahí sí el box
+        // queda mudo, y se reportan las dos cosas (qué audio faltó y que no sonó nada), igual
+        // que Android.
+        let a = vec![asset_bajado("b1"), asset_sin_bajar("b2")];
+        let mut r = row(a, Some(SPOT_ROTATION_ROUND_ROBIN));
+        r.file_path = String::new();
+
+        let pick = resolve_spot_audio(&r, Some("b1"));
+        assert_eq!(pick.cursor_asset_id.as_deref(), Some("b2"), "el cursor avanza igual");
+        assert_eq!(pick.file_path, None, "no suena nada");
+        assert_eq!(pick.asset_id, None);
+        assert_eq!(pick.pending_failure, Some(FAIL_ASSET_NOT_CACHED), "el audio que faltó");
+        assert_eq!(pick.failure_reason, Some(FAIL_DOWNLOAD), "y además el box quedó mudo");
+    }
+
+    #[test]
+    fn opcion_a_el_throttle_de_fallos_distingue_un_asset_de_otro() {
+        // Un box con varios audios sin bajar tiene que poder reportar CADA uno: si la clave
+        // del throttle fuera sólo (schedule, motivo), el primero que cae en la ventana taparía
+        // a los demás y soporte vería un solo audio roto de tres.
+        let pick = SpotPick {
+            schedule_id: "ss1".into(),
+            spot_id: "sp1".into(),
+            asset_id: None,
+            cursor_asset_id: Some("a2".into()),
+            file_path: None,
+            failure_reason: None,
+            pending_failure: Some(FAIL_ASSET_NOT_CACHED),
+            expected_duration: 0.0,
+        };
+        let clave_a2 = format!("{}|{}|{}", pick.schedule_id, "a2", FAIL_ASSET_NOT_CACHED);
+        let clave_a3 = format!("{}|{}|{}", pick.schedule_id, "a3", FAIL_ASSET_NOT_CACHED);
+        assert_ne!(clave_a2, clave_a3);
+        // Y el camino legacy (sin asset) mantiene la clave de siempre, sin asset en el medio.
+        let clave_legacy = format!("{}|{}|{}", pick.schedule_id, "", FAIL_AUDIO_MISSING);
+        assert!(clave_legacy.contains("ss1||audio_missing"));
+    }
+
+    // ── Paso 7: rotation desconocido ─────────────────────────────────────────
+
+    #[test]
+    fn paso7_rotation_desconocido_cae_al_audio_por_defecto() {
+        let f = std::env::temp_dir().join("ms_rot_fallback.mp3");
+        std::fs::write(&f, b"x").unwrap();
+        let mut r = row(assets(&["a1", "a2"]), Some("WEIGHTED_V2_DEL_FUTURO"));
+        r.file_path = f.to_string_lossy().to_string();
+
+        let pick = resolve_spot_audio(&r, None);
+        assert_eq!(pick.asset_id, None, "no se inventa una rotación que no se entiende");
+        assert_eq!(pick.file_path.as_deref(), Some(r.file_path.as_str()));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn paso7_assets_sin_rotation_tambien_cae_al_default() {
+        let r = row(assets(&["a1", "a2"]), None);
+        assert_eq!(resolve_spot_audio(&r, None).asset_id, None);
+    }
+
+    // ── Cursor que sobrevive un reinicio ─────────────────────────────────────
+
+    #[test]
+    fn el_cursor_sobrevive_un_reinicio() {
+        // "Reinicio" = el proceso muere y el cursor se relee de SQLite. Se testea contra el
+        // MISMO SQL que usa prod (`config_cache`), en una DB temporal.
+        let dir = std::env::temp_dir().join("ms_cursor_restart_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("millsonic.db");
+
+        let a = assets(&["a1", "a2", "a3"]);
+
+        // Sesión 1: dos turnos.
+        {
+            let conn = db::test_support::open(&path);
+            let mut cursor = db::test_support::get_spot_last_asset(&conn, "ss1");
+            assert_eq!(cursor, None, "equipo nuevo = sin cursor");
+            for esperado in ["a1", "a2"] {
+                let elegido = pick_rotation_asset(&a, cursor.as_deref()).unwrap().id.clone();
+                assert_eq!(elegido, esperado);
+                db::test_support::set_spot_last_asset(&conn, "ss1", &elegido);
+                cursor = Some(elegido);
+            }
+        }
+
+        // Sesión 2: proceso nuevo, DB en disco. NO vuelve a a1.
+        {
+            let conn = db::test_support::open(&path);
+            let cursor = db::test_support::get_spot_last_asset(&conn, "ss1");
+            assert_eq!(cursor.as_deref(), Some("a2"), "el cursor se perdió en el reinicio");
+            assert_eq!(pick_rotation_asset(&a, cursor.as_deref()).unwrap().id, "a3");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn la_cadencia_sobrevive_un_reinicio() {
+        let dir = std::env::temp_dir().join("ms_cadencia_restart_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("millsonic.db");
+        {
+            let conn = db::test_support::open(&path);
+            db::test_support::set_last_spot_at(&conn, 1_762_000_000);
+            db::test_support::set_last_spot_schedule_id(&conn, "ss-7");
+        }
+        {
+            let conn = db::test_support::open(&path);
+            assert_eq!(db::test_support::get_last_spot_at(&conn), Some(1_762_000_000));
+            assert_eq!(db::test_support::get_last_spot_schedule_id(&conn).as_deref(), Some("ss-7"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Cierre de la emisión ─────────────────────────────────────────────────
+
+    #[test]
+    fn clasificacion_del_cierre_de_emision() {
+        // Sonó entero (duración conocida).
+        assert_eq!(classify_spot_end(20.0, 20.0), (db::SpotOutcome::Completed, None));
+        // 80% exacto sigue siendo completo (misma fórmula que los plays de música).
+        assert_eq!(classify_spot_end(16.0, 20.0), (db::SpotOutcome::Completed, None));
+        // mp3 truncado: el sink dijo "terminé" a los 3s de un audio de 20s.
+        assert_eq!(
+            classify_spot_end(3.0, 20.0),
+            (db::SpotOutcome::Interrupted, Some(FAIL_SHORT))
+        );
+        // Duración desconocida (camino legacy): se cree al sink.
+        assert_eq!(classify_spot_end(12.0, 0.0), (db::SpotOutcome::Completed, None));
+        // Lo cortó el cap anti-freeze de 45s: el cliente NO escuchó el anuncio entero.
+        assert_eq!(
+            classify_spot_end(audio::MAX_SPOT_PLAYBACK_SECONDS, 0.0),
+            (db::SpotOutcome::Interrupted, Some(FAIL_CAP))
+        );
+    }
+
+    #[test]
+    fn el_cap_de_45s_no_se_movio() {
+        // Con ROTACIÓN suena UN audio por turno, así que el cap sigue siendo correcto. Si
+        // alguien implementa tandas (N audios seguidos) este assert tiene que fallar y
+        // obligar a pensarlo de nuevo — 4×20s se cortarían a los 45.
+        assert_eq!(audio::MAX_SPOT_PLAYBACK_SECONDS, 45.0);
+    }
+
+    // ── Throttle de fallos ───────────────────────────────────────────────────
+
+    #[test]
+    fn el_throttle_de_fallos_deja_pasar_el_primero_y_frena_la_catarata() {
+        let w = SPOT_FAILURE_THROTTLE_SECS;
+        assert!(failure_throttle_allows(None, 1000, w), "el primero siempre pasa");
+        assert!(!failure_throttle_allows(Some(1000), 1000 + w - 1, w), "dentro de la ventana, no");
+        assert!(failure_throttle_allows(Some(1000), 1000 + w, w), "pasada la ventana, sí");
+        // Reloj que se fue para atrás: mejor reportar de más que callarse para siempre.
+        assert!(failure_throttle_allows(Some(1000), 500, w));
+    }
+}
+
+#[cfg(test)]
+mod two_advance_paths_tests {
+    /// Este repo YA se comió el bug: el camino de crossfade no llamaba a `find_eligible_spot`,
+    /// así que en toda zona con crossfade (el default de retail) los anuncios NO sonaban nunca.
+    /// Son DOS caminos de avance entre temas (crossfade-path y finish-path) y lo que se inyecta
+    /// entre temas tiene que estar en los DOS (memoria `player_two_advance_paths`).
+    ///
+    /// El test es estructural a propósito: `check_track_advancement` necesita un `AppHandle` de
+    /// Tauri y una tarjeta de audio, así que no se puede ejecutar en un unit test. Lo que SÍ se
+    /// puede garantizar mecánicamente es que no haya un segundo camino que se saltee la
+    /// rotación, el cursor, la cadencia o el reporte.
+    const SRC: &str = include_str!("sync.rs");
+
+    /// Sólo el código de PRODUCCIÓN: se corta en el primer `cfg(test)` para que los literales
+    /// de los propios tests no se cuenten a sí mismos.
+    fn veces(aguja: &str) -> usize {
+        SRC.split("#[cfg(test)]").next().unwrap_or("").matches(aguja).count()
+    }
+
+    #[test]
+    fn los_dos_caminos_de_avance_disparan_el_spot_por_el_mismo_helper() {
+        // 2 llamadas: una en el camino de crossfade, otra en el de finish.
+        assert_eq!(
+            veces("find_eligible_spot(&tz,"),
+            2,
+            "los anuncios tienen que evaluarse en los DOS caminos de avance"
+        );
+        assert_eq!(
+            veces("start_spot_playback(&mut player,"),
+            2,
+            "los DOS caminos tienen que arrancar el spot por el mismo helper"
+        );
+    }
+
+    #[test]
+    fn nadie_reproduce_un_spot_por_fuera_del_helper() {
+        // Un `play_spot_file` suelto se saltearía el cursor de rotación, la cadencia y el
+        // reporte de emisión. Único lugar permitido: dentro de `start_spot_playback`.
+        assert_eq!(
+            veces("play_spot_file("),
+            1,
+            "hay un camino de reproducción de spots que no pasa por start_spot_playback"
+        );
+    }
+
+    #[test]
+    fn la_emision_se_cierra_en_un_solo_lugar() {
+        // `close_on_air_spot` se llama en 2 lugares: el cierre normal (fin del spot, que es
+        // común a los dos caminos) y el cierre forzado por supersede dentro del helper.
+        assert_eq!(veces("close_on_air_spot("), 3, "definición + 2 llamadas");
     }
 }

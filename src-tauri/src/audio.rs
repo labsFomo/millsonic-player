@@ -5,7 +5,10 @@ use serde::Serialize;
 /// Cap de seguridad para la reproducción de un spot. Un anuncio real dura <30s; si el sink
 /// nunca reporta empty (mp3 corrupto, decode trancado, archivo borrado del cache), `is_finished`
 /// usa este cap para no congelar el player eternamente. Ver bug VM 0.9.5 (spot HOLA trancado 39min).
-const MAX_SPOT_PLAYBACK_SECONDS: f32 = 45.0;
+/// `pub` sólo para que el reporte de emisión pueda distinguir "sonó entero" de "lo cortó el
+/// cap". El valor NO se toca: con rotación suena UN audio por turno, así que 45s sigue siendo
+/// correcto (no hay tandas).
+pub const MAX_SPOT_PLAYBACK_SECONDS: f32 = 45.0;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct TrackInfo {
@@ -459,8 +462,26 @@ impl AudioPlayer {
         self.crossfade_duration_secs = secs;
     }
 
-    /// Play a spot audio file (one-shot, not part of playlist)
+    /// Play a spot audio file (one-shot, not part of playlist).
+    ///
+    /// Wrapper que garantiza la INVARIANTE: si el anuncio no arrancó, `playing_spot` queda en
+    /// false. El cuerpo prendía el flag arriba de todo y tres caminos de error salían con
+    /// `?`/`map_err` sin apagarlo (stat, open y decode del archivo). Con el flag colgado el
+    /// crossfade se desactiva (`check_track_advancement` lo saltea si `playing_spot`) y el
+    /// siguiente fin de tema se interpreta como "terminó un spot" → avanza de más. Antes era
+    /// casi inalcanzable porque un box sin archivo en disco ni llegaba a elegirse; ahora que
+    /// esos boxes SÍ se evalúan (para poder reportar el fallo), el camino se usa de verdad.
     pub fn play_spot_file(&mut self, file_path: &str) -> Result<(), String> {
+        match self.play_spot_file_inner(file_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.playing_spot = false;
+                Err(e)
+            }
+        }
+    }
+
+    fn play_spot_file_inner(&mut self, file_path: &str) -> Result<(), String> {
         log::info!("Playing spot: {}", file_path);
         self.playing_spot = true;
         // Reset position timer so is_finished() doesn't immediately trigger
